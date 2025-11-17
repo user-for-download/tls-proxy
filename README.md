@@ -27,7 +27,7 @@ High-performance TLS proxy server with domain filtering and TLS handshake fragme
 
 ```bash
 # Clone repository
-git clone <your-repo-url>
+git clone https://github.com/user-for-download/tls-proxy
 cd tls-proxy
 
 # Build release version
