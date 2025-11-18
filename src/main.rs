@@ -3,11 +3,11 @@
 mod domain_filter;
 
 use crate::domain_filter::DomainFilter;
-
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use clap::Parser;
@@ -213,13 +213,34 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
 
-    #[cfg(target_os = "linux")]
-    socket.set_reuse_port(true)?;
-
     socket.set_nonblocking(true)?;
-    socket.bind(&addr.into())?;
-    socket.listen(1024)?;
 
+    match socket.bind(&addr.into()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::AddrInUse => {
+            eprintln!("\n❌ PORT {} ALREADY IN USE\n", args.port);
+            eprintln!("   Active processes on port {}:", args.port);
+            let _ = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&format!(
+                    "lsof -i:{} -P -n | grep LISTEN || echo ''",
+                    args.port
+                ))
+                .status();
+            eprintln!(
+                "\n   Kill them all: sudo kill -9 $(lsof -t -i:{})",
+                args.port
+            );
+            eprintln!("\n   Or just run with different port: --port 8101\n");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Bind failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    socket.listen(1024)?;
     let listener = TcpListener::from_std(socket.into())?;
 
     info!("🚀 Proxy listening on http://{}", addr);
