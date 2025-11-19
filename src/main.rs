@@ -11,11 +11,11 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 const MAX_TLS_RECORD_SIZE: usize = 16384;
 const MAX_KEEPALIVE: usize = 100;
@@ -83,7 +83,7 @@ impl Stats {
 
     fn print(&self) {
         info!(
-            "total={} active={} blocked={} whitelisted={} fragmented={} failed={} in={}MB out={}MB",
+            "STATS | total={} active={} blocked={} whitelisted={} fragmented={} failed={} in={}MB out={}MB",
             self.total.load(Ordering::Relaxed),
             self.active.load(Ordering::Relaxed),
             self.blocked.load(Ordering::Relaxed),
@@ -96,7 +96,6 @@ impl Stats {
     }
 }
 
-// RAII Guard to ensure active count is always decremented
 struct ConnectionGuard {
     stats: Arc<Stats>,
 }
@@ -148,9 +147,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let filter = Arc::new(DomainFilter::new());
 
     if let Some(ref path) = args.blacklist {
+        info!("Loading blacklist from {:?}", path);
         filter.load_blacklist(path)?;
     }
     if let Some(ref path) = args.whitelist {
+        info!("Loading whitelist from {:?}", path);
         filter.load_whitelist(path)?;
     }
 
@@ -176,8 +177,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     match socket.bind(&addr.into()) {
         Ok(()) => {}
         Err(e) if e.kind() == ErrorKind::AddrInUse => {
-            eprintln!("\nERROR: Port {} is already in use.", args.port);
-            eprintln!("Check active processes with: lsof -i:{}", args.port);
+            error!("Port {} is already in use.", args.port);
             std::process::exit(1);
         }
         Err(e) => return Err(e.into()),
@@ -203,27 +203,34 @@ async fn run(args: Args) -> anyhow::Result<()> {
         let config = config.clone();
 
         tokio::spawn(async move {
-            // Guard manages increment/decrement of active stats automatically
             let _guard = ConnectionGuard::new(config.stats.clone());
 
+            // Updated: Removed client_addr argument here
             if let Err(e) = handle_connection(client_stream, config.clone()).await {
-                debug!("Connection error from {}: {}", client_addr, e);
-                config.stats.failed.fetch_add(1, Ordering::Relaxed);
+                if e.downcast_ref::<std::io::Error>().map_or(true, |io_e| io_e.kind() != ErrorKind::UnexpectedEof) {
+                    // We still use client_addr from the loop scope for this error log
+                    debug!("Connection error from {}: {}", client_addr, e);
+                    config.stats.failed.fetch_add(1, Ordering::Relaxed);
+                }
             }
         });
     }
 }
 
-async fn handle_connection(mut client: TcpStream, config: ProxyConfig) -> anyhow::Result<()> {
+#[tracing::instrument(skip(client, config))]
+async fn handle_connection(
+    mut client: TcpStream,
+    config: ProxyConfig
+) -> anyhow::Result<()> {
     let _ = client.set_nodelay(true);
+
+    let peer_addr = client.peer_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+    trace!("Handling connection from {}", peer_addr);
+
     let mut keepalive_count = 0usize;
     let mut buf = [0u8; MAX_HEADER_SIZE];
 
     loop {
-        // Reset buffer read position handling not required as we re-parse from 0
-        // But for a persistent connection, we need to handle previous data.
-        // Simplified: We assume client sends headers in one go or we wait up to buffer limit.
-
         let read_timeout = if keepalive_count == 0 {
             Duration::from_secs(5)
         } else {
@@ -232,45 +239,43 @@ async fn handle_connection(mut client: TcpStream, config: ProxyConfig) -> anyhow
 
         let n = match timeout(read_timeout, client.read(&mut buf)).await {
             Ok(Ok(n)) if n > 0 => n,
-            Ok(Ok(_)) => break, // EOF
-            Ok(Err(_)) | Err(_) => break, // Error or Timeout
+            Ok(Ok(_)) => break,
+            Ok(Err(_)) | Err(_) => break,
         };
 
         let data = &buf[..n];
 
-        // 1. Check special internal endpoints
         if handle_direct_http(data, &mut client, &config.stats).await? {
             if !should_keep_alive(data) {
+                debug!("Internal request served, closing connection");
                 break;
             }
             if keepalive_count >= MAX_KEEPALIVE {
+                debug!("Max keepalive reached for internal requests");
                 break;
             }
             keepalive_count += 1;
             continue;
         }
 
-        // 2. Parse HTTP
         match parse_http_request(data) {
             Ok(Some((method, path, headers))) => {
+                debug!(method = %method, path = %path, client = %peer_addr, "Parsed Request");
+
                 if method == "CONNECT" {
                     handle_connect(client, &path, &config).await?;
-                    // CONNECT takes over the stream, so we exit the loop
                     return Ok(());
                 } else {
                     handle_http(client, headers, data, &config).await?;
-                    // Standard HTTP proxy usually closes or requires complex state management
-                    // For simplicity, we exit after one request unless we implement full pipelining
                     return Ok(());
                 }
             }
             Ok(None) => {
-                // Incomplete headers. In a full implementation, we would read more.
-                // Here we just drop to avoid complexity.
-                debug!("Incomplete headers received, dropping.");
+                debug!("Incomplete HTTP headers received, dropping connection");
                 break;
             }
-            Err(_) => {
+            Err(e) => {
+                debug!("HTTP parse error: {}", e);
                 break;
             }
         }
@@ -293,7 +298,6 @@ async fn handle_direct_http(
         return Ok(false);
     }
 
-    // Fast path for internal checks
     if !request.starts_with(b"GET ") {
         return Ok(false);
     }
@@ -378,45 +382,40 @@ async fn handle_connect(
 
     if config.filter.is_blacklisted(host) {
         config.stats.blocked.fetch_add(1, Ordering::Relaxed);
-        debug!("Blocked CONNECT: {}", host);
+        warn!("BLOCKED CONNECT: {}", host);
         let _ = client.write_all(RESPONSE_403).await;
         return Ok(());
     }
 
-    // 1. Reply 200 to Client
     client.write_all(RESPONSE_200_CONNECT).await?;
-    // Ensure the 200 OK is sent before we start connecting to upstream,
-    // though some proxies wait. Standard is to establish upstream first, then 200.
 
-    // Connect upstream
+    let start = Instant::now();
     let server_connect = match config.connect_timeout {
         Some(to) => timeout(to, TcpStream::connect((host, port))).await.map_err(|_| anyhow::anyhow!("Timeout"))?,
         None => TcpStream::connect((host, port)).await,
     };
 
     let mut server = match server_connect {
-        Ok(s) => s,
+        Ok(s) => {
+            debug!("Connected to upstream {}:{} in {:.2?}", host, port, start.elapsed());
+            s
+        },
         Err(e) => {
-            // If we failed to connect upstream, we already sent 200 OK, which is problematic.
-            // ideally we connect first, then send 200. But if we connect first, we might verify
-            // an SNI that isn't there yet.
-            warn!("Failed to connect to upstream {}: {}", target, e);
+            warn!("Failed to connect to upstream {}:{}: {}", host, port, e);
             return Err(e.into());
         }
     };
 
     let _ = server.set_nodelay(true);
 
-    // Check whitelist for fragmentation
     let should_fragment = !config.filter.is_whitelisted(host);
     if !should_fragment {
         config.stats.whitelisted.fetch_add(1, Ordering::Relaxed);
     } else {
-        // Try to fragment the TLS handshake
+        trace!("Applying fragmentation to {}", host);
         let _ = fragment_tls_handshake(&mut client, &mut server, &config.stats).await;
     }
 
-    // Tunnel
     let copy = match config.idle_timeout {
         Some(to) => timeout(to, tokio::io::copy_bidirectional(&mut client, &mut server)).await,
         None => Ok(tokio::io::copy_bidirectional(&mut client, &mut server).await),
@@ -454,15 +453,18 @@ async fn handle_http(
 
     if config.filter.is_blacklisted(host_name) {
         config.stats.blocked.fetch_add(1, Ordering::Relaxed);
-        debug!("Blocked HTTP: {}", host_name);
+        warn!("BLOCKED HTTP: {}", host_name);
         let _ = client.write_all(RESPONSE_403).await;
         return Ok(());
     }
 
+    let start = Instant::now();
     let mut server = match config.connect_timeout {
         Some(to) => timeout(to, TcpStream::connect((host_name, port))).await.map_err(|_| anyhow::anyhow!("Timeout"))?,
         None => TcpStream::connect((host_name, port)).await,
     }?;
+
+    debug!("Connected to HTTP upstream {}:{} in {:.2?}", host_name, port, start.elapsed());
 
     let _ = server.set_nodelay(true);
     let _ = server.write_all(initial_data).await;
@@ -488,13 +490,13 @@ async fn fragment_tls_handshake(
     let mut header = [0u8; 5];
     let mut body = vec![0u8; MAX_TLS_RECORD_SIZE];
 
-    // Read header with timeout
     if timeout(Duration::from_secs(5), client.read_exact(&mut header)).await.is_err() {
         return Ok(());
     }
 
-    // Validate TLS Handshake (Content Type 22 (0x16), Version 3.1-3.3)
+    // Validate TLS Handshake
     if header[0] != 0x16 || header[1] != 0x03 || (header[2] < 0x01 || header[2] > 0x03) {
+        trace!("Not a standard TLS ClientHello, forwarding directly");
         let _ = server.write_all(&header).await;
         return Ok(());
     }
@@ -505,10 +507,7 @@ async fn fragment_tls_handshake(
         return Ok(());
     }
 
-    // Read full body
     if timeout(Duration::from_secs(5), client.read_exact(&mut body[..record_len])).await.is_err() {
-        // If we fail to read the full body, we can't fragment.
-        // We can try to forward what we read, but state is messy. Just drop.
         return Ok(());
     }
 
@@ -518,14 +517,11 @@ async fn fragment_tls_handshake(
     let mut rng = OsRng;
     let strategy = rng.next_u32() % 100;
 
-    // Determine cut points
     let fragments: Vec<usize> = if strategy < 60 {
-        // Split into 2: small random start, rest
         let first = (rng.next_u32() as usize % 8) + 1;
         let first = first.min(record_len);
         vec![first, record_len - first]
     } else if strategy < 90 {
-        // Split into 3
         let p1 = (rng.next_u32() as usize % 12) + 1;
         let p1 = p1.min(record_len);
         let remaining = record_len - p1;
@@ -533,7 +529,6 @@ async fn fragment_tls_handshake(
         let p2 = p2.min(remaining);
         vec![p1, p2, remaining - p2]
     } else {
-        // Tiny first byte
         if record_len > 1 {
             vec![1, record_len - 1]
         } else {
@@ -569,4 +564,57 @@ async fn fragment_tls_handshake(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_keep_alive() {
+        let case1 = b"GET / HTTP/1.1\r\nHost: foo\r\nConnection: keep-alive\r\n\r\n";
+        assert!(should_keep_alive(case1));
+
+        let case2 = b"GET / HTTP/1.1\r\nHost: foo\r\nConnection: close\r\n\r\n";
+        assert!(!should_keep_alive(case2));
+
+        let case3 = b"GET / HTTP/1.1\r\nHost: foo\r\nconnection: Keep-Alive\r\n\r\n";
+        assert!(should_keep_alive(case3));
+    }
+
+    #[test]
+    fn test_parse_http_basic() {
+        let req = b"GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let res = parse_http_request(req).unwrap().unwrap();
+        assert_eq!(res.0, "GET");
+        assert_eq!(res.1, "/index.html");
+        assert_eq!(res.2[0], ("host".to_string(), "example.com".to_string()));
+    }
+
+    #[test]
+    fn test_parse_http_connect() {
+        let req = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+        let res = parse_http_request(req).unwrap().unwrap();
+        assert_eq!(res.0, "CONNECT");
+        assert_eq!(res.1, "example.com:443");
+    }
+
+    #[test]
+    fn test_parse_http_partial() {
+        // Incomplete header
+        let req = b"GET / HTTP/1.1\r\nHost: exa";
+        let res = parse_http_request(req).unwrap();
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn test_stats_increment() {
+        let stats = Arc::new(Stats::new());
+        let _guard = ConnectionGuard::new(stats.clone());
+        assert_eq!(stats.active.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.total.load(Ordering::Relaxed), 1);
+        drop(_guard);
+        assert_eq!(stats.active.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.total.load(Ordering::Relaxed), 1);
+    }
 }

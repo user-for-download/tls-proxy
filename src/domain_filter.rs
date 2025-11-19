@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::Arc;
+use tracing::{debug, info, warn};
 
 const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
 const MAX_DOMAINS: usize = 10_000_000;
@@ -39,16 +40,31 @@ impl DomainFilter {
     }
 
     pub fn is_blacklisted(&self, domain: &str) -> bool {
-        // Common optimization: check if empty before acquiring lock or processing
-        if domain.is_empty() { return false; }
+        if domain.is_empty() {
+            return false;
+        }
         let domain_lower = domain.to_ascii_lowercase();
-        self.blacklist.read().matches(&domain_lower)
+        let (matched, reason) = self.blacklist.read().matches_with_reason(&domain_lower);
+        if matched {
+            debug!(
+                "Blacklist hit: {} (Reason: {})",
+                domain,
+                reason.unwrap_or("unknown".parse().unwrap())
+            );
+        }
+        matched
     }
 
     pub fn is_whitelisted(&self, domain: &str) -> bool {
-        if domain.is_empty() { return false; }
+        if domain.is_empty() {
+            return false;
+        }
         let domain_lower = domain.to_ascii_lowercase();
-        self.whitelist.read().matches(&domain_lower)
+        let (matched, _) = self.whitelist.read().matches_with_reason(&domain_lower);
+        if matched {
+            debug!("Whitelist hit: {}", domain);
+        }
+        matched
     }
 
     fn load(path: &Path, name: &str) -> Result<DomainSet> {
@@ -80,14 +96,17 @@ impl DomainFilter {
                         if is_valid_domain(&d) {
                             exact.insert(d);
                             count += 1;
+                        } else {
+                            warn!("Invalid exact domain in {}: {}", name, d);
                         }
                     }
                     ParsedDomain::Suffix(d) => {
                         if is_valid_domain(&d) {
-                            // Insert into trie reversed: "example.com" -> "moc.elpmaxe"
                             let reversed: String = d.chars().rev().collect();
                             suffix_trie.insert(reversed, ());
                             count += 1;
+                        } else {
+                            warn!("Invalid suffix domain in {}: {}", name, d);
                         }
                     }
                 }
@@ -98,14 +117,15 @@ impl DomainFilter {
             }
         }
 
-        let domain_set = DomainSet {
-            exact,
-            suffix_trie,
-        };
+        let domain_set = DomainSet { exact, suffix_trie };
 
-        tracing::info!(
-            "Loaded {}: {} active rules from {} lines",
-            name, count, raw_count
+        info!(
+            "Loaded {}: {} active rules from {} lines ({} exact, {} suffix)",
+            name,
+            count,
+            raw_count,
+            domain_set.exact.len(),
+            domain_set.suffix_trie.len()
         );
 
         Ok(domain_set)
@@ -118,7 +138,6 @@ impl DomainFilter {
             return None;
         }
 
-        // Basic adblock syntax cleanup
         domain = domain.strip_prefix("@@").unwrap_or(domain);
         domain = domain.strip_prefix("||").unwrap_or(domain);
 
@@ -142,11 +161,6 @@ impl DomainFilter {
         }
 
         let domain_lower = domain.to_ascii_lowercase();
-
-        // Determine type.
-        // *.example.com -> Suffix "example.com"
-        // .example.com  -> Suffix "example.com"
-        // *example.com  -> Suffix "example.com" (Treated same for perf, enforces dot boundary)
 
         if let Some(d) = domain_lower.strip_prefix("*.") {
             Some(ParsedDomain::Suffix(d.to_string()))
@@ -175,41 +189,38 @@ impl Default for DomainSet {
 }
 
 impl DomainSet {
-    fn matches(&self, domain: &str) -> bool {
+    fn matches_with_reason(&self, domain: &str) -> (bool, Option<String>) {
         if self.exact.contains(domain) {
-            return true;
+            return (true, Some("Exact Match".to_string()));
         }
 
-        // Check Suffix Trie
-        // We reverse the domain: "mail.google.com" -> "moc.elgoog.liam"
-        // Trie contains "moc.elgoog"
         if !self.suffix_trie.is_empty() {
             let reversed: String = domain.chars().rev().collect();
 
             if let Some(subtrie) = self.suffix_trie.get_ancestor(&reversed) {
-                // We found a prefix in the reversed string (which is a suffix in original)
-                // e.g. Found "moc.elgoog" inside "moc.elgoog.liam"
                 let key = subtrie.key().unwrap();
 
-                // If lengths match, it's an exact match on the suffix rule (e.g. "google.com")
+                // Case 1: Exact match on the suffix (e.g. rule "example.com", input "example.com")
                 if key.len() == reversed.len() {
-                    return true;
+                    return (true, Some("Exact Suffix Match".to_string()));
                 }
 
-                // If shorter, we must ensure boundary is a dot.
-                // reversed: "moc.elgoog.liam" (len 15)
-                // key:      "moc.elgoog"      (len 10)
-                // Check char at index 10 in reversed.
+                // Case 2: Subdomain match.
+                // reversed input: "moc.elpmaxe.bus"
+                // key found:      "moc.elpmaxe"
+                // We need to ensure that the next character in input is a dot.
                 if reversed.as_bytes().get(key.len()) == Some(&b'.') {
-                    return true;
+                    let matched_suffix: String = key.chars().rev().collect();
+                    return (true, Some(format!("Suffix Match: *.{}", matched_suffix)));
                 }
             }
         }
 
-        false
+        (false, None)
     }
 }
 
+#[derive(Debug, PartialEq)]
 enum ParsedDomain {
     Exact(String),
     Suffix(String),
@@ -227,9 +238,124 @@ fn is_valid_domain(domain: &str) -> bool {
         if label.is_empty() || label.len() > MAX_LABEL_LENGTH {
             return false;
         }
-        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        if !label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
             return false;
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn test_validation() {
+        assert!(is_valid_domain("example.com"));
+        assert!(is_valid_domain("sub.example.com"));
+        assert!(is_valid_domain("xn--123.com"));
+        assert!(is_valid_domain("my-domain.com"));
+
+        assert!(!is_valid_domain(""));
+        assert!(!is_valid_domain(".example.com"));
+        assert!(!is_valid_domain("example.com."));
+        assert!(!is_valid_domain("ex ample.com"));
+        assert!(!is_valid_domain("example..com"));
+        assert!(!is_valid_domain(&"a".repeat(300))); // Too long
+    }
+
+    #[test]
+    fn test_parsing_lines() {
+        // Basic
+        assert_eq!(
+            DomainFilter::parse_domain_line("example.com"),
+            Some(ParsedDomain::Exact("example.com".into()))
+        );
+        // Adblock syntax
+        assert_eq!(
+            DomainFilter::parse_domain_line("||example.com"),
+            Some(ParsedDomain::Exact("example.com".into()))
+        );
+        // Wildcards
+        assert_eq!(
+            DomainFilter::parse_domain_line("*.example.com"),
+            Some(ParsedDomain::Suffix("example.com".into()))
+        );
+        assert_eq!(
+            DomainFilter::parse_domain_line(".example.com"),
+            Some(ParsedDomain::Suffix("example.com".into()))
+        );
+        // URLs
+        assert_eq!(
+            DomainFilter::parse_domain_line("https://example.com/foo"),
+            Some(ParsedDomain::Exact("example.com".into()))
+        );
+        // Leading www stripping
+        assert_eq!(
+            DomainFilter::parse_domain_line("www.example.com"),
+            Some(ParsedDomain::Exact("example.com".into()))
+        );
+        // Comments
+        assert_eq!(DomainFilter::parse_domain_line("# comment"), None);
+    }
+
+    #[test]
+    fn test_trie_matching_logic() {
+        let mut set = DomainSet::default();
+        // Insert "google.com" into suffix trie -> "moc.elgoog"
+        let rev: String = "google.com".chars().rev().collect();
+        set.suffix_trie.insert(rev, ());
+
+        // 1. Exact match
+        assert!(set.matches_with_reason("google.com").0);
+        // 2. Subdomain match
+        assert!(set.matches_with_reason("mail.google.com").0);
+        assert!(set.matches_with_reason("a.b.google.com").0);
+        // 3. No match
+        assert!(!set.matches_with_reason("google.co.uk").0);
+        // 4. Boundary check (Crucial!) - "notgoogle.com" should NOT match "google.com"
+        assert!(!set.matches_with_reason("notgoogle.com").0);
+    }
+
+    #[test]
+    fn test_filter_integration() {
+        let filter = DomainFilter::new();
+        // Simulate loading directly into structs to avoid file IO in this specific test
+        {
+            let mut w = filter.blacklist.write();
+            w.exact.insert("bad.com".into());
+            let rev: String = "evil.com".chars().rev().collect();
+            w.suffix_trie.insert(rev, ());
+        }
+
+        assert!(filter.is_blacklisted("bad.com"));
+        assert!(!filter.is_blacklisted("good.com"));
+
+        // Trie tests via public API
+        assert!(filter.is_blacklisted("evil.com"));
+        assert!(filter.is_blacklisted("www.evil.com"));
+        assert!(!filter.is_blacklisted("not-evil.com")); // Boundary check
+    }
+
+    #[test]
+    fn test_file_loading() -> Result<()> {
+        let mut temp = tempfile::NamedTempFile::new()?;
+        writeln!(temp, "example.com")?;
+        writeln!(temp, "*.wildcard.com")?;
+        writeln!(temp, "invalid..domain")?; // Should be warned and ignored
+        writeln!(temp, "# Comment")?;
+
+        let filter = DomainFilter::new();
+        filter.load_blacklist(temp.path())?;
+
+        assert!(filter.is_blacklisted("example.com"));
+        assert!(filter.is_blacklisted("foo.wildcard.com"));
+        assert!(!filter.is_blacklisted("other.com"));
+
+        Ok(())
+    }
 }
