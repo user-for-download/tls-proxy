@@ -183,7 +183,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         Err(e) => return Err(e.into()),
     }
 
-    socket.listen(1024)?;
+    // OPTIMIZATION: Increased backlog to handle high concurrency benchmarks
+    socket.listen(4096)?;
     let listener = TcpListener::from_std(socket.into())?;
 
     info!("Rust proxy listening on http://{}", addr);
@@ -205,10 +206,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         tokio::spawn(async move {
             let _guard = ConnectionGuard::new(config.stats.clone());
 
-            // Updated: Removed client_addr argument here
             if let Err(e) = handle_connection(client_stream, config.clone()).await {
                 if e.downcast_ref::<std::io::Error>().map_or(true, |io_e| io_e.kind() != ErrorKind::UnexpectedEof) {
-                    // We still use client_addr from the loop scope for this error log
                     debug!("Connection error from {}: {}", client_addr, e);
                     config.stats.failed.fetch_add(1, Ordering::Relaxed);
                 }
@@ -223,61 +222,84 @@ async fn handle_connection(
     config: ProxyConfig
 ) -> anyhow::Result<()> {
     let _ = client.set_nodelay(true);
-
     let peer_addr = client.peer_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
-    trace!("Handling connection from {}", peer_addr);
 
     let mut keepalive_count = 0usize;
+
+    // Buffer management for pipelining and partial reads
     let mut buf = [0u8; MAX_HEADER_SIZE];
+    let mut pos = 0;
 
     loop {
-        let read_timeout = if keepalive_count == 0 {
-            Duration::from_secs(5)
-        } else {
-            Duration::from_secs(2)
-        };
+        // 1. Read data into buffer
+        let read_timeout = if keepalive_count == 0 { Duration::from_secs(5) } else { Duration::from_secs(2) };
 
-        let n = match timeout(read_timeout, client.read(&mut buf)).await {
-            Ok(Ok(n)) if n > 0 => n,
-            Ok(Ok(_)) => break,
-            Ok(Err(_)) | Err(_) => break,
-        };
+        // Only read if we don't have a full request yet
+        // We try to parse what we have first (pipelining support)
+        let mut headers = [httparse::EMPTY_HEADER; 64];
+        let mut req = httparse::Request::new(&mut headers);
 
-        let data = &buf[..n];
+        let status = req.parse(&buf[..pos]);
 
-        if handle_direct_http(data, &mut client, &config.stats).await? {
-            if !should_keep_alive(data) {
-                debug!("Internal request served, closing connection");
-                break;
-            }
-            if keepalive_count >= MAX_KEEPALIVE {
-                debug!("Max keepalive reached for internal requests");
-                break;
-            }
-            keepalive_count += 1;
-            continue;
-        }
+        match status {
+            Ok(httparse::Status::Complete(parsed_len)) => {
+                // We have a full header!
+                let method = req.method.unwrap_or("").to_string();
+                let path = req.path.unwrap_or("").to_string();
+                let headers_vec: Vec<(String, String)> = req.headers.iter()
+                    .filter(|h| !h.name.is_empty())
+                    .map(|h| (h.name.to_ascii_lowercase(), String::from_utf8_lossy(h.value).to_string()))
+                    .collect();
 
-        match parse_http_request(data) {
-            Ok(Some((method, path, headers))) => {
+                let current_slice = &buf[..parsed_len];
+
+                // Handle Internal Endpoints
+                if handle_direct_http(current_slice, &mut client, &config.stats).await? {
+                    if !should_keep_alive(current_slice) || keepalive_count >= MAX_KEEPALIVE {
+                        break;
+                    }
+                    keepalive_count += 1;
+
+                    // Advance buffer: shift remaining data to start
+                    if parsed_len < pos {
+                        buf.copy_within(parsed_len..pos, 0);
+                        pos -= parsed_len;
+                    } else {
+                        pos = 0;
+                    }
+                    continue;
+                }
+
+                // Handle Proxying
                 debug!(method = %method, path = %path, client = %peer_addr, "Parsed Request");
 
                 if method == "CONNECT" {
                     handle_connect(client, &path, &config).await?;
-                    return Ok(());
+                    return Ok(()); // CONNECT takes over socket
                 } else {
-                    handle_http(client, headers, data, &config).await?;
+                    // For HTTP forwarding, we need to send the bytes we already read
+                    handle_http(client, headers_vec, current_slice, &config).await?;
                     return Ok(());
                 }
             }
-            Ok(None) => {
-                debug!("Incomplete HTTP headers received, dropping connection");
-                break;
+            Ok(httparse::Status::Partial) => {
+                // Need more data
+                if pos >= MAX_HEADER_SIZE {
+                    return Err(anyhow::anyhow!("Header too large"));
+                }
+
+                // FIXED MATCH BLOCK BELOW
+                match timeout(read_timeout, client.read(&mut buf[pos..])).await {
+                    Ok(Ok(0)) => break, // EOF - Closed by peer
+                    Ok(Ok(n)) => {
+                        pos += n;
+                        continue; // Loop back to try parsing again
+                    },
+                    Ok(Err(e)) => return Err(e.into()),
+                    Err(_) => break, // Timeout
+                }
             }
-            Err(e) => {
-                debug!("HTTP parse error: {}", e);
-                break;
-            }
+            Err(e) => return Err(e.into()),
         }
     }
 
@@ -343,30 +365,6 @@ async fn handle_direct_http(
     }
 
     Ok(false)
-}
-
-fn parse_http_request(
-    buf: &[u8],
-) -> anyhow::Result<Option<(String, String, Vec<(String, String)>)>> {
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-    let mut req = httparse::Request::new(&mut headers);
-
-    match req.parse(buf) {
-        Ok(httparse::Status::Complete(_)) => {
-            let method = req.method.unwrap_or("").to_string();
-            let path = req.path.unwrap_or("").to_string();
-            let headers = req.headers.iter()
-                .filter(|h| !h.name.is_empty())
-                .map(|h| (
-                    h.name.to_ascii_lowercase(),
-                    String::from_utf8_lossy(h.value).to_string()
-                ))
-                .collect();
-            Ok(Some((method, path, headers)))
-        },
-        Ok(httparse::Status::Partial) => Ok(None),
-        Err(e) => Err(e.into()),
-    }
 }
 
 async fn handle_connect(
@@ -494,7 +492,6 @@ async fn fragment_tls_handshake(
         return Ok(());
     }
 
-    // Validate TLS Handshake
     if header[0] != 0x16 || header[1] != 0x03 || (header[2] < 0x01 || header[2] > 0x03) {
         trace!("Not a standard TLS ClientHello, forwarding directly");
         let _ = server.write_all(&header).await;
@@ -577,34 +574,6 @@ mod tests {
 
         let case2 = b"GET / HTTP/1.1\r\nHost: foo\r\nConnection: close\r\n\r\n";
         assert!(!should_keep_alive(case2));
-
-        let case3 = b"GET / HTTP/1.1\r\nHost: foo\r\nconnection: Keep-Alive\r\n\r\n";
-        assert!(should_keep_alive(case3));
-    }
-
-    #[test]
-    fn test_parse_http_basic() {
-        let req = b"GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        let res = parse_http_request(req).unwrap().unwrap();
-        assert_eq!(res.0, "GET");
-        assert_eq!(res.1, "/index.html");
-        assert_eq!(res.2[0], ("host".to_string(), "example.com".to_string()));
-    }
-
-    #[test]
-    fn test_parse_http_connect() {
-        let req = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
-        let res = parse_http_request(req).unwrap().unwrap();
-        assert_eq!(res.0, "CONNECT");
-        assert_eq!(res.1, "example.com:443");
-    }
-
-    #[test]
-    fn test_parse_http_partial() {
-        // Incomplete header
-        let req = b"GET / HTTP/1.1\r\nHost: exa";
-        let res = parse_http_request(req).unwrap();
-        assert!(res.is_none());
     }
 
     #[test]

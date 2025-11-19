@@ -17,7 +17,8 @@ Ensure you have Rust installed.
 ```bash
 # Build for release (optimized)
 cargo build --release
--------------
+```
+```bash
 running 10 tests
 test domain_filter::tests::test_filter_integration ... ok
 test domain_filter::tests::test_parsing_lines ... ok
@@ -31,6 +32,52 @@ test tests::test_should_keep_alive ... ok
 test tests::test_stats_increment ... ok
 
 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+```bash
+❯ oha -c 400 -n 100000 http://127.0.0.1:8101/bench
+Summary:
+  Success rate:	99.72%
+  Total:	6347.8329 ms
+  Slowest:	70.7065 ms
+  Fastest:	1.2383 ms
+  Average:	25.3339 ms
+  Requests/sec:	15753.4078
+
+  Total data:	194.76 KiB
+  Size/request:	2 B
+  Size/sec:	30.68 KiB
+
+Response time histogram:
+   1.238 ms [1]     |
+   8.185 ms [852]   |
+  15.132 ms [9814]  |■■■■■■■■■■
+  22.079 ms [27558] |■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  29.026 ms [31042] |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  35.972 ms [18936] |■■■■■■■■■■■■■■■■■■■
+  42.919 ms [7919]  |■■■■■■■■
+  49.866 ms [2715]  |■■
+  56.813 ms [719]   |
+  63.760 ms [145]   |
+  70.706 ms [14]    |
+
+Response time distribution:
+  10.00% in 14.8712 ms
+  25.00% in 19.1837 ms
+  50.00% in 24.5265 ms
+  75.00% in 30.6089 ms
+  90.00% in 36.9056 ms
+  95.00% in 41.1199 ms
+  99.00% in 49.3038 ms
+  99.90% in 58.2519 ms
+  99.99% in 66.7251 ms
+
+
+Details (average, fastest, slowest):
+  DNS+dialup:	11.4076 ms, 0.0725 ms, 42.0992 ms
+  DNS-lookup:	0.0040 ms, 0.0016 ms, 5.6722 ms
+
+Status code distribution:
+  [200] 99715 responses
 ```
 
 ## Usage
