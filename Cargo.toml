@@ -1,47 +1,33 @@
 [package]
 name = "tls-proxy"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
-tokio = { version = "1.48", features = ["full"] }
+tokio = { version = "1.48", features = ["rt-multi-thread", "net", "io-util", "time", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-radix_trie = "0.3"
+radix_trie = "0.3.0" 
 parking_lot = "0.12"
-num_cpus = "1.17.0"
+num_cpus = "1.16"
 socket2 = "0.6.1"
-
+httparse = "1.9"
+rand = "0.8.5"
 
 [dev-dependencies]
-tempfile = "3.23"
+tempfile = "3.10"
 
 [profile.dev]
-opt-level = 0
+opt-level = 1
 debug = true
 incremental = true
 
 [profile.release]
-opt-level = 2
-lto = "thin"
-codegen-units = 16
-debug = false
-strip = true
-incremental = false
-
-[profile.production]
-inherits = "release"
 opt-level = 3
-lto = true
+lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
-
-[profile.bench]
-inherits = "release"
-debug = true
-
-[profile.release.package."*"]
-opt-level = 2
+incremental = false
