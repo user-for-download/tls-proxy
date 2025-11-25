@@ -19,65 +19,51 @@ Ensure you have Rust installed.
 cargo build --release
 ```
 ```bash
-running 10 tests
-test domain_filter::tests::test_filter_integration ... ok
-test domain_filter::tests::test_parsing_lines ... ok
-test domain_filter::tests::test_file_loading ... ok
-test domain_filter::tests::test_trie_matching_logic ... ok
-test domain_filter::tests::test_validation ... ok
-test tests::test_parse_http_basic ... ok
-test tests::test_parse_http_connect ... ok
-test tests::test_parse_http_partial ... ok
-test tests::test_should_keep_alive ... ok
-test tests::test_stats_increment ... ok
-
-test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-```
-```bash
-❯ oha -c 400 -n 100000 http://127.0.0.1:8101/bench
+❯ oha -c 400 -n 1000000 http://127.0.0.1:8100/bench
 Summary:
-  Success rate:	99.72%
-  Total:	6347.8329 ms
-  Slowest:	70.7065 ms
-  Fastest:	1.2383 ms
-  Average:	25.3339 ms
-  Requests/sec:	15753.4078
+  Success rate:	99.99%
+  Total:	14700.9164 ms
+  Slowest:	123.6573 ms
+  Fastest:	0.0517 ms
+  Average:	5.8673 ms
+  Requests/sec:	68022.9705
 
-  Total data:	194.76 KiB
+  Total data:	1.91 MiB
   Size/request:	2 B
-  Size/sec:	30.68 KiB
+  Size/sec:	132.85 KiB
 
 Response time histogram:
-   1.238 ms [1]     |
-   8.185 ms [852]   |
-  15.132 ms [9814]  |■■■■■■■■■■
-  22.079 ms [27558] |■■■■■■■■■■■■■■■■■■■■■■■■■■■■
-  29.026 ms [31042] |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
-  35.972 ms [18936] |■■■■■■■■■■■■■■■■■■■
-  42.919 ms [7919]  |■■■■■■■■
-  49.866 ms [2715]  |■■
-  56.813 ms [719]   |
-  63.760 ms [145]   |
-  70.706 ms [14]    |
+    0.052 ms [1]      |
+   12.412 ms [971012] |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+   24.773 ms [28297]  |
+   37.133 ms [536]    |
+   49.494 ms [68]     |
+   61.855 ms [0]      |
+   74.215 ms [0]      |
+   86.576 ms [0]      |
+   98.936 ms [6]      |
+  111.297 ms [3]      |
+  123.657 ms [2]      |
 
 Response time distribution:
-  10.00% in 14.8712 ms
-  25.00% in 19.1837 ms
-  50.00% in 24.5265 ms
-  75.00% in 30.6089 ms
-  90.00% in 36.9056 ms
-  95.00% in 41.1199 ms
-  99.00% in 49.3038 ms
-  99.90% in 58.2519 ms
-  99.99% in 66.7251 ms
+  10.00% in 2.8038 ms
+  25.00% in 3.9102 ms
+  50.00% in 5.4274 ms
+  75.00% in 7.2152 ms
+  90.00% in 9.3969 ms
+  95.00% in 11.0675 ms
+  99.00% in 15.2254 ms
+  99.90% in 22.6648 ms
+  99.99% in 35.9506 ms
 
 
 Details (average, fastest, slowest):
-  DNS+dialup:	11.4076 ms, 0.0725 ms, 42.0992 ms
-  DNS-lookup:	0.0040 ms, 0.0016 ms, 5.6722 ms
+  DNS+dialup:	3.9301 ms, 0.0731 ms, 85.7917 ms
+  DNS-lookup:	0.0068 ms, 0.0015 ms, 6.0484 ms
 
 Status code distribution:
-  [200] 99715 responses
+  [200] 999925 responses
+
 ```
 
 ## Usage
