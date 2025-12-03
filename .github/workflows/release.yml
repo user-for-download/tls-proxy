@@ -1,0 +1,152 @@
+name: Build Release
+
+# 1. Update triggers to run on tags starting with 'v'
+on:
+  push:
+    branches: [main, master]
+    tags:
+      - "v*" # Triggers on v0.1.0, v1.0.0, etc.
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: tls-proxy
+
+permissions:
+  contents: write # Required to create releases
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source "$HOME/.cargo/env"
+
+      - name: Build Linux x64
+        run: |
+          source "$HOME/.cargo/env"
+          cargo build --release
+          mkdir -p dist
+          cp target/release/${BINARY_NAME} dist/${BINARY_NAME}-linux-x64
+          strip dist/${BINARY_NAME}-linux-x64 || true
+
+      - name: Upload Linux artifact
+        if: ${{ !env.ACT }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tls-proxy-linux-x64
+          path: dist/tls-proxy-linux-x64
+
+  build-windows:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source "$HOME/.cargo/env"
+          rustup target add x86_64-pc-windows-gnu
+
+      - name: Build Windows x64
+        run: |
+          source "$HOME/.cargo/env"
+          cargo build --release --target x86_64-pc-windows-gnu
+          mkdir -p dist
+          cp target/x86_64-pc-windows-gnu/release/${BINARY_NAME}.exe dist/${BINARY_NAME}-windows-x64.exe
+
+      - name: Upload Windows artifact
+        if: ${{ !env.ACT }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tls-proxy-windows-x64
+          path: dist/tls-proxy-windows-x64.exe
+
+  build-macos:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source "$HOME/.cargo/env"
+          rustup target add x86_64-apple-darwin
+          rustup target add aarch64-apple-darwin
+
+      - name: Install Zig Toolchain
+        run: |
+          sudo apt-get update && sudo apt-get install -y wget xz-utils
+          wget -q https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz
+          tar -xf zig-linux-x86_64-0.13.0.tar.xz
+          sudo mv zig-linux-x86_64-0.13.0 /usr/local/zig
+          echo "/usr/local/zig" >> $GITHUB_PATH
+
+      - name: Install cargo-zigbuild
+        run: |
+          source "$HOME/.cargo/env"
+          cargo install cargo-zigbuild
+
+      - name: Build macOS x64
+        run: |
+          source "$HOME/.cargo/env"
+          cargo zigbuild --release --target x86_64-apple-darwin
+          mkdir -p dist
+          cp target/x86_64-apple-darwin/release/${BINARY_NAME} dist/${BINARY_NAME}-macos-x64
+
+      - name: Build macOS ARM64
+        run: |
+          source "$HOME/.cargo/env"
+          cargo zigbuild --release --target aarch64-apple-darwin
+          cp target/aarch64-apple-darwin/release/${BINARY_NAME} dist/${BINARY_NAME}-macos-arm64
+
+      - name: Upload macOS x64
+        if: ${{ !env.ACT }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tls-proxy-macos-x64
+          path: dist/tls-proxy-macos-x64
+
+      - name: Upload macOS ARM64
+        if: ${{ !env.ACT }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tls-proxy-macos-arm64
+          path: dist/tls-proxy-macos-arm64
+
+  # 2. New Job: Create Release
+  create-release:
+    needs: [build-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') && !env.ACT
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display structure of downloaded files
+        run: ls -R artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/tls-proxy-linux-x64/tls-proxy-linux-x64
+            artifacts/tls-proxy-windows-x64/tls-proxy-windows-x64.exe
+            artifacts/tls-proxy-macos-x64/tls-proxy-macos-x64
+            artifacts/tls-proxy-macos-arm64/tls-proxy-macos-arm64
+          generate_release_notes: true
