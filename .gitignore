@@ -1,0 +1,7 @@
+/target
+.github
+bin/
+promt.md
+Cargo.lock
+whitelist.txt
+blacklist.txt
