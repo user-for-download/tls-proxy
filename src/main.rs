@@ -468,82 +468,82 @@ async fn run(args: Args) -> Result<()> {
 
     loop {
         tokio::select! {
-                    biased;
+            biased;
 
-                    () = cancel_token.cancelled() => {
-                        let active = stats.active_count();
-                        if active > 0 {
-                            info!("Waiting for {} active connections to finish...", active);
-                        }
-                        break;
-                    }
-
-                    accept_result = listener.accept() => {
-                        let (client_stream, client_addr) = match accept_result {
-                            Ok(v) => v,
-                            Err(e) => {
-                                warn!("Accept error: {}", e);
-                                tokio::time::sleep(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)).await;
-                                continue;
-                            }
-                        };
-
-                        let permit = match semaphore.clone().try_acquire_owned() {
-                            Ok(permit) => permit,
-                            Err(_) => {
-                                stats.inc_rejected();
-                                warn!("Connection limit reached, rejecting {}", client_addr);
-                                let _ = client_stream.try_write(RESPONSE_503);
-                                continue;
-                            }
-                        };
-
-                        let config = config.clone();
-                        let conn_cancel = cancel_token.clone();
-
-                        // In the accept loop, replace the tokio::spawn block:
-
-        tokio::spawn(async move {
-            let _permit = permit;
-            let _guard = ConnectionGuard::new(config.stats.clone());
-
-            // Create and pin the handler future once
-            let handler = handle_connection(client_stream, client_addr, config.clone());
-            tokio::pin!(handler);
-
-            let result = tokio::select! {
-                biased;
-                () = conn_cancel.cancelled() => {
-                    debug!("Connection {} entering grace period", client_addr);
-                    // Allow in-flight work to complete within grace period
-                    match timeout(
-                        Duration::from_secs(GRACE_PERIOD_SECS),
-                        &mut handler  // Borrow the pinned future
-                    ).await {
-                        Ok(r) => r,
-                        Err(_) => {
-                            debug!("Grace period timeout for {}", client_addr);
-                            Ok(())
-                        }
-                    }
+            () = cancel_token.cancelled() => {
+                let active = stats.active_count();
+                if active > 0 {
+                    info!("Waiting for {} active connections to finish...", active);
                 }
-                r = &mut handler => r,  // Borrow the pinned future
-            };
-
-            if let Err(e) = result {
-                let is_eof = e
-                    .downcast_ref::<std::io::Error>()
-                    .map_or(false, |io_e| io_e.kind() == ErrorKind::UnexpectedEof);
-
-                if !is_eof {
-                    debug!("Connection error from {}: {:#}", client_addr, e);
-                    config.stats.inc_failed();
-                }
+                break;
             }
-        });
 
+            accept_result = listener.accept() => {
+                let (client_stream, client_addr) = match accept_result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("Accept error: {}", e);
+                        tokio::time::sleep(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)).await;
+                        continue;
                     }
-                }
+                };
+
+                let permit = match semaphore.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        stats.inc_rejected();
+                        warn!("Connection limit reached, rejecting {}", client_addr);
+                        let _ = client_stream.try_write(RESPONSE_503);
+                        continue;
+                    }
+                };
+
+                let config = config.clone();
+                let conn_cancel = cancel_token.clone();
+
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let _guard = ConnectionGuard::new(config.stats.clone());
+
+                    // Create and pin the handler future once
+                    let handler = handle_connection(client_stream, client_addr, config.clone());
+                    tokio::pin!(handler);
+
+                    let result = tokio::select! {
+                        biased;
+                        () = conn_cancel.cancelled() => {
+                            debug!("Connection {} entering grace period", client_addr);
+                            // Allow in-flight work to complete within grace period
+                            match timeout(
+                                Duration::from_secs(GRACE_PERIOD_SECS),
+                                &mut handler  // Borrow the pinned future
+                            ).await {
+                                Ok(r) => r,
+                                Err(_) => {
+                                    debug!("Grace period timeout for {}", client_addr);
+                                    Ok(())
+                                }
+                            }
+                        }
+                        r = &mut handler => r,  // Borrow the pinned future
+                    };
+
+                    if let Err(e) = result {
+                        let is_expected = e.downcast_ref::<std::io::Error>()
+                            .map_or(false, |io_e|
+                                io_e.kind() == ErrorKind::UnexpectedEof ||
+                                io_e.kind() == ErrorKind::ConnectionReset ||
+                                io_e.kind() == ErrorKind::BrokenPipe
+                            );
+
+                        if !is_expected {
+                            debug!("Connection error from {}: {:#}", client_addr, e);
+                            config.stats.inc_failed();
+                        }
+                    }
+                });
+            }
+        }
     }
 
     if stats.active_count() > 0 {
@@ -1022,10 +1022,6 @@ async fn handle_http(
 // TLS Fragmentation
 // ============================================================================
 
-// ============================================================================
-// TLS Fragmentation
-// ============================================================================
-
 async fn fragment_tls_handshake(
     client: &mut TcpStream,
     server: &mut TcpStream,
@@ -1052,6 +1048,7 @@ async fn fragment_tls_handshake(
         return Ok(());
     }
 
+    // NOTE: Allocating large Vec for body. For ultra-optimization, consider a buffer pool.
     let mut body = vec![0u8; record_len];
     match timeout(Duration::from_secs(5), client.read_exact(&mut body)).await {
         Ok(Ok(_)) => {}
@@ -1069,7 +1066,6 @@ async fn fragment_tls_handshake(
 
     let fragments = generate_fragment_sizes(record_len, config);
 
-    // Use slice splitting to avoid unused assignment warning
     let mut remaining = &body[..];
     for (i, &size) in fragments.iter().enumerate() {
         if size == 0 {
@@ -1104,6 +1100,7 @@ async fn fragment_tls_handshake(
 
     Ok(())
 }
+
 #[inline]
 fn generate_fragment_sizes(record_len: usize, config: &ProxyConfig) -> Vec<usize> {
     let strategy = config.random_u32() % 100;
