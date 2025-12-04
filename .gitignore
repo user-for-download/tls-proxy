@@ -3,3 +3,4 @@ bin/
 Cargo.lock
 whitelist.txt
 blacklist.txt
+.idea

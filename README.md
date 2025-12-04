@@ -1,11 +1,10 @@
 # Rust TLS Proxy
 
-A high-performance, asynchronous HTTP/HTTPS proxy written in Rust. It features Deep Packet Inspection (DPI) evasion via TLS ClientHello fragmentation and efficient domain filtering using Radix Tries.
+A high-performance, asynchronous HTTP/HTTPS proxy written in Rust. 
 
 ## Features
 
 *   **High Performance:** Built on `tokio` with multi-threading and minimized memory copying.
-*   **DPI Evasion:** Automatically fragments TLS ClientHello packets to bypass SNI-based filtering/throttling.
 *   **Domain Filtering:** fast `O(k)` blacklisting and whitelisting (supports adblock-style syntax).
 *   **Observability:** Structured logging via `tracing` and internal stats endpoints.
 *   **Resilience:** Connection pooling limits, timeouts, and RAII-based resource management.
@@ -19,50 +18,32 @@ Ensure you have Rust installed.
 cargo build --release
 ```
 ```bash
-❯ oha -c 400 -n 1000000 http://127.0.0.1:8100/bench
+oha -c 400 -n 1000000 http://127.0.0.1:8101/bench
 Summary:
-  Success rate:	99.99%
-  Total:	14700.9164 ms
-  Slowest:	123.6573 ms
-  Fastest:	0.0517 ms
-  Average:	5.8673 ms
-  Requests/sec:	68022.9705
+  Success rate:	100.00%
+  Total:	14135.5881 ms
+  Slowest:	55.9926 ms
+  Fastest:	0.0496 ms
+  Average:	5.6414 ms
+  Requests/sec:	70743.4310
 
   Total data:	1.91 MiB
   Size/request:	2 B
-  Size/sec:	132.85 KiB
+  Size/sec:	138.17 KiB
 
 Response time histogram:
-    0.052 ms [1]      |
-   12.412 ms [971012] |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
-   24.773 ms [28297]  |
-   37.133 ms [536]    |
-   49.494 ms [68]     |
-   61.855 ms [0]      |
-   74.215 ms [0]      |
-   86.576 ms [0]      |
-   98.936 ms [6]      |
-  111.297 ms [3]      |
-  123.657 ms [2]      |
-
-Response time distribution:
-  10.00% in 2.8038 ms
-  25.00% in 3.9102 ms
-  50.00% in 5.4274 ms
-  75.00% in 7.2152 ms
-  90.00% in 9.3969 ms
-  95.00% in 11.0675 ms
-  99.00% in 15.2254 ms
-  99.90% in 22.6648 ms
-  99.99% in 35.9506 ms
-
+   0.050 ms [1]      |
+   5.644 ms [563199] |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  11.238 ms [404590] |■■■■■■■■■■■■■■■■■■■■■■
+  16.832 ms [28726]  |■
+  22.427 ms [2615]   |
 
 Details (average, fastest, slowest):
-  DNS+dialup:	3.9301 ms, 0.0731 ms, 85.7917 ms
-  DNS-lookup:	0.0068 ms, 0.0015 ms, 6.0484 ms
+  DNS+dialup:	17.4072 ms, 0.1554 ms, 41.8514 ms
+  DNS-lookup:	0.0026 ms, 0.0017 ms, 0.0394 ms
 
 Status code distribution:
-  [200] 999925 responses
+  [200] 1000000 responses
 
 ```
 
@@ -71,7 +52,7 @@ Status code distribution:
 Run the binary from the target directory:
 
 ```bash
-./target/release/tls-proxy --port 8101 --blacklist blocked.txt
+./target/release/tls-proxy --blacklist blacklist.txt --whitelist whitelist.txt
 ```
 
 ### Command Line Arguments
@@ -85,21 +66,12 @@ Run the binary from the target directory:
 | `--log-level` | `info` | Logging level (`trace`, `debug`, `info`, `warn`, `error`). |
 | `--stats-interval`| `60` | Seconds between printing stats to stdout. |
 
-### Environment Variables
-
-You can also control logging via `RUST_LOG`:
-
-```bash
-RUST_LOG=debug ./tls-proxy
-```
-
 ## Filter List Syntax
 
 The proxy supports a subset of standard adblock syntax for blacklists and whitelists.
 
 **Supported formats:**
 *   `example.com` (Exact match)
-*   `||example.com` (normalized to exact match)
 *   `*.example.com` (Wildcard suffix)
 *   `.example.com` (Wildcard suffix)
 
