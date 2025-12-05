@@ -3,7 +3,7 @@ name: Build Release
 # 1. Update triggers to run on tags starting with 'v'
 on:
   push:
-    branches: [main, master]
+    branches: [main]
     tags:
       - "v*" # Triggers on v0.1.0, v1.0.0, etc.
   pull_request:

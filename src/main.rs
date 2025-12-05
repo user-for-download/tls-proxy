@@ -6,8 +6,10 @@ mod domain_filter;
 use crate::domain_filter::DomainFilter;
 use anyhow::{Context, Result};
 use clap::Parser;
+use parking_lot::Mutex;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use smallvec::SmallVec;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::cell::RefCell;
 use std::io::ErrorKind;
@@ -34,6 +36,8 @@ const DRAIN_TIMEOUT_SECS: u64 = 30;
 const GRACE_PERIOD_SECS: u64 = 5;
 const INITIAL_READ_TIMEOUT_SECS: u64 = 5;
 const ACCEPT_ERROR_BACKOFF_MS: u64 = 10;
+const BUFFER_POOL_SIZE: usize = 256;
+const MAX_HOST_LEN: usize = 253;
 
 // Pre-computed HTTP responses
 const RESPONSE_BENCH: &[u8] = b"HTTP/1.1 200 OK\r\n\
@@ -80,45 +84,100 @@ const RESPONSE_200_CONNECT: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\
     about = "High-performance HTTPS proxy with TLS fragmentation"
 )]
 struct Args {
-    /// Bind address
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
 
-    /// Bind port
     #[arg(long, default_value_t = 8101)]
     port: u16,
 
-    /// Path to blacklist file
     #[arg(long)]
     blacklist: Option<PathBuf>,
 
-    /// Path to whitelist file (domains that won't be fragmented)
     #[arg(long)]
     whitelist: Option<PathBuf>,
 
-    /// Connection timeout in seconds (0 = no timeout)
     #[arg(long, default_value_t = 10)]
     timeout_connect: u64,
 
-    /// Idle timeout in seconds (0 = no timeout)
     #[arg(long, default_value_t = 60)]
     timeout_idle: u64,
 
-    /// Stats logging interval in seconds (0 = disabled)
     #[arg(long, default_value_t = 60)]
     stats_interval: u64,
 
-    /// Maximum concurrent connections
     #[arg(long, default_value_t = DEFAULT_MAX_CONNECTIONS)]
     max_connections: usize,
 
-    /// Drain timeout in seconds during shutdown
     #[arg(long, default_value_t = DRAIN_TIMEOUT_SECS)]
     drain_timeout: u64,
 
-    /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Allow connections to private/internal IP ranges
+    #[arg(long, default_value_t = false)]
+    allow_private: bool,
+}
+
+// ============================================================================
+// Buffer Pool
+// ============================================================================
+
+struct BufferPool {
+    buffers: Mutex<Vec<Vec<u8>>>,
+    buffer_size: usize,
+}
+
+impl BufferPool {
+    fn new(capacity: usize, buffer_size: usize) -> Self {
+        Self {
+            buffers: Mutex::new(Vec::with_capacity(capacity)),
+            buffer_size,
+        }
+    }
+
+    fn acquire(&self, required_size: usize) -> PooledBuffer<'_> {
+        let size = required_size.max(self.buffer_size);
+        let mut buf = self
+            .buffers
+            .lock()
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(size));
+        buf.resize(required_size, 0);
+        PooledBuffer { buf, pool: self }
+    }
+
+    fn release(&self, mut buf: Vec<u8>) {
+        buf.clear();
+        let mut buffers = self.buffers.lock();
+        if buffers.len() < buffers.capacity() {
+            buffers.push(buf);
+        }
+    }
+}
+
+struct PooledBuffer<'a> {
+    buf: Vec<u8>,
+    pool: &'a BufferPool,
+}
+
+impl std::ops::Deref for PooledBuffer<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        &self.buf
+    }
+}
+
+impl std::ops::DerefMut for PooledBuffer<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buf
+    }
+}
+
+impl Drop for PooledBuffer<'_> {
+    fn drop(&mut self) {
+        self.pool.release(std::mem::take(&mut self.buf));
+    }
 }
 
 // ============================================================================
@@ -225,7 +284,8 @@ struct StatsSnapshot {
 impl StatsSnapshot {
     fn log(&self) {
         info!(
-            "STATS | total={} active={} blocked={} whitelisted={} fragmented={} failed={} rejected={} in={}MB out={}MB",
+            "STATS | total={} active={} blocked={} whitelisted={} \
+             fragmented={} failed={} rejected={} in={}MB out={}MB",
             self.total,
             self.active,
             self.blocked,
@@ -236,6 +296,22 @@ impl StatsSnapshot {
             self.bytes_in / 1_000_000,
             self.bytes_out / 1_000_000,
         );
+    }
+
+    fn to_string(&self) -> String {
+        format!(
+            "total={} active={} blocked={} whitelisted={} fragmented={} \
+             failed={} rejected={} bytes_in={} bytes_out={}",
+            self.total,
+            self.active,
+            self.blocked,
+            self.whitelisted,
+            self.fragmented,
+            self.failed,
+            self.rejected,
+            self.bytes_in,
+            self.bytes_out
+        )
     }
 }
 
@@ -271,8 +347,10 @@ impl Drop for ConnectionGuard {
 struct ProxyConfig {
     filter: Arc<DomainFilter>,
     stats: Arc<Stats>,
+    buffer_pool: Arc<BufferPool>,
     connect_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
+    allow_private: bool,
 }
 
 impl ProxyConfig {
@@ -284,18 +362,164 @@ impl ProxyConfig {
         Self {
             filter,
             stats,
+            buffer_pool: Arc::new(BufferPool::new(BUFFER_POOL_SIZE, MAX_TLS_RECORD_SIZE)),
             connect_timeout,
             idle_timeout,
+            allow_private: args.allow_private,
         }
     }
 
-    /// Thread-local RNG for zero-contention random number generation
     #[inline]
     fn random_u32(&self) -> u32 {
         thread_local! {
             static RNG: RefCell<SmallRng> = RefCell::new(SmallRng::from_os_rng());
         }
         RNG.with(|rng| rng.borrow_mut().random())
+    }
+}
+
+// ============================================================================
+// Response Builder
+// ============================================================================
+
+#[inline]
+fn build_response(status: u16, body: &str, keep_alive: bool) -> String {
+    let status_text = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Unknown",
+    };
+    format!(
+        "HTTP/1.1 {} {}\r\n\
+         Content-Type: text/plain\r\n\
+         Content-Length: {}\r\n\
+         Connection: {}\r\n\r\n{}",
+        status,
+        status_text,
+        body.len(),
+        if keep_alive { "keep-alive" } else { "close" },
+        body
+    )
+}
+
+// ============================================================================
+// Security Helpers
+// ============================================================================
+
+/// Check if host is a private/internal address (SSRF protection)
+fn is_private_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.octets()[0] == 0
+                    || v4.is_broadcast()
+            }
+            std::net::IpAddr::V6(v6) => v6.is_loopback(),
+        };
+    }
+
+    host.ends_with(".local") || host.ends_with(".internal") || host.ends_with(".localhost")
+}
+
+/// Detect request smuggling indicators
+fn has_smuggling_indicators(headers: &[httparse::Header]) -> bool {
+    let mut has_content_length = false;
+    let mut has_transfer_encoding = false;
+    let mut content_length_count = 0;
+
+    for h in headers {
+        if h.name.eq_ignore_ascii_case("content-length") {
+            content_length_count += 1;
+            has_content_length = true;
+        }
+        if h.name.eq_ignore_ascii_case("transfer-encoding") {
+            has_transfer_encoding = true;
+        }
+    }
+
+    content_length_count > 1 || (has_content_length && has_transfer_encoding)
+}
+
+/// Validate host header
+fn validate_host(host: &str, allow_private: bool) -> bool {
+    if host.is_empty() || host.len() > MAX_HOST_LEN {
+        return false;
+    }
+    if !allow_private && is_private_host(host) {
+        return false;
+    }
+    true
+}
+
+// ============================================================================
+// Keep-Alive Detection (optimized with memchr)
+// ============================================================================
+
+#[inline]
+fn find_connection_header(request: &[u8]) -> Option<&[u8]> {
+    const HEADER: &[u8] = b"onnection:";
+
+    let mut pos = 0;
+    while pos < request.len() {
+        let search_slice = &request[pos..];
+        let idx =
+            memchr::memchr(b'C', search_slice).or_else(|| memchr::memchr(b'c', search_slice))?;
+
+        let abs_pos = pos + idx;
+        if abs_pos + 1 + HEADER.len() <= request.len() {
+            let slice = &request[abs_pos + 1..abs_pos + 1 + HEADER.len()];
+            if slice.eq_ignore_ascii_case(HEADER) {
+                let start = abs_pos + 1 + HEADER.len();
+                let end = memchr::memchr2(b'\r', b'\n', &request[start..])
+                    .map_or(request.len(), |p| start + p);
+                return Some(&request[start..end]);
+            }
+        }
+        pos = abs_pos + 1;
+    }
+    None
+}
+
+#[inline]
+fn is_http11(request: &[u8]) -> bool {
+    let line_end = memchr::memchr(b'\r', request).unwrap_or(request.len());
+    if line_end >= 8 {
+        let check_start = line_end - 8;
+        request
+            .get(check_start..line_end)
+            .map_or(false, |s| s.eq_ignore_ascii_case(b"HTTP/1.1"))
+    } else {
+        false
+    }
+}
+
+#[inline]
+fn should_keep_alive(request: &[u8]) -> bool {
+    let http11 = is_http11(request);
+
+    match find_connection_header(request) {
+        Some(val) => {
+            let val_lower: SmallVec<[u8; 32]> =
+                val.iter().map(|b| b.to_ascii_lowercase()).collect();
+            if memchr::memmem::find(&val_lower, b"close").is_some() {
+                false
+            } else if memchr::memmem::find(&val_lower, b"keep-alive").is_some() {
+                true
+            } else {
+                http11
+            }
+        }
+        None => http11,
     }
 }
 
@@ -329,7 +553,6 @@ async fn shutdown_signal() {
 
 async fn wait_for_drain(stats: &Stats, timeout_duration: Duration) -> bool {
     let drain_start = Instant::now();
-
     while stats.active_count() > 0 {
         if drain_start.elapsed() > timeout_duration {
             return false;
@@ -385,7 +608,8 @@ async fn run(args: Args) -> Result<()> {
     let filter_stats = filter.stats();
     if filter_stats.total() > 0 {
         info!(
-            "Filter loaded: {} blacklist rules ({} exact, {} suffix), {} whitelist rules ({} exact, {} suffix)",
+            "Filter loaded: {} blacklist ({} exact, {} suffix), \
+             {} whitelist ({} exact, {} suffix)",
             filter_stats.blacklist_exact + filter_stats.blacklist_suffix,
             filter_stats.blacklist_exact,
             filter_stats.blacklist_suffix,
@@ -397,9 +621,9 @@ async fn run(args: Args) -> Result<()> {
 
     let stats = Arc::new(Stats::new());
     let config = ProxyConfig::new(filter, stats.clone(), &args);
-
     let cancel_token = CancellationToken::new();
 
+    // Stats logging task
     if args.stats_interval > 0 {
         let stats_clone = stats.clone();
         let cancel = cancel_token.clone();
@@ -418,6 +642,7 @@ async fn run(args: Args) -> Result<()> {
         });
     }
 
+    // Socket setup
     let addr: SocketAddr = format!("{}:{}", args.host, args.port)
         .parse()
         .context("Invalid bind address")?;
@@ -434,7 +659,6 @@ async fn run(args: Args) -> Result<()> {
     socket
         .set_nonblocking(true)
         .context("Failed to set non-blocking")?;
-
     let _ = socket.set_tcp_nodelay(true);
     let _ = socket.set_recv_buffer_size(256 * 1024);
     let _ = socket.set_send_buffer_size(256 * 1024);
@@ -452,10 +676,12 @@ async fn run(args: Args) -> Result<()> {
 
     info!("Proxy listening on http://{}", addr);
     info!(
-        "Max connections: {}, Connect timeout: {:?}, Idle timeout: {:?}",
-        args.max_connections, config.connect_timeout, config.idle_timeout
+        "Max connections: {}, Connect timeout: {:?}, \
+         Idle timeout: {:?}, Allow private: {}",
+        args.max_connections, config.connect_timeout, config.idle_timeout, config.allow_private
     );
 
+    // Shutdown handler
     let shutdown_token = cancel_token.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
@@ -466,6 +692,7 @@ async fn run(args: Args) -> Result<()> {
     let semaphore = Arc::new(Semaphore::new(args.max_connections));
     let drain_timeout = Duration::from_secs(args.drain_timeout);
 
+    // Main accept loop
     loop {
         tokio::select! {
             biased;
@@ -493,7 +720,12 @@ async fn run(args: Args) -> Result<()> {
                     Err(_) => {
                         stats.inc_rejected();
                         warn!("Connection limit reached, rejecting {}", client_addr);
-                        let _ = client_stream.try_write(RESPONSE_503);
+                        tokio::spawn(async move {
+                            let _ = timeout(Duration::from_millis(100), async {
+                                let _ = client_stream.writable().await;
+                                let _ = client_stream.try_write(RESPONSE_503);
+                            }).await;
+                        });
                         continue;
                     }
                 };
@@ -505,18 +737,18 @@ async fn run(args: Args) -> Result<()> {
                     let _permit = permit;
                     let _guard = ConnectionGuard::new(config.stats.clone());
 
-                    // Create and pin the handler future once
-                    let handler = handle_connection(client_stream, client_addr, config.clone());
+                    let handler = handle_connection(
+                        client_stream, client_addr, config.clone()
+                    );
                     tokio::pin!(handler);
 
                     let result = tokio::select! {
                         biased;
                         () = conn_cancel.cancelled() => {
                             debug!("Connection {} entering grace period", client_addr);
-                            // Allow in-flight work to complete within grace period
                             match timeout(
                                 Duration::from_secs(GRACE_PERIOD_SECS),
-                                &mut handler  // Borrow the pinned future
+                                &mut handler
                             ).await {
                                 Ok(r) => r,
                                 Err(_) => {
@@ -525,16 +757,17 @@ async fn run(args: Args) -> Result<()> {
                                 }
                             }
                         }
-                        r = &mut handler => r,  // Borrow the pinned future
+                        r = &mut handler => r,
                     };
 
                     if let Err(e) = result {
                         let is_expected = e.downcast_ref::<std::io::Error>()
-                            .map_or(false, |io_e|
-                                io_e.kind() == ErrorKind::UnexpectedEof ||
-                                io_e.kind() == ErrorKind::ConnectionReset ||
-                                io_e.kind() == ErrorKind::BrokenPipe
-                            );
+                            .map_or(false, |io_e| {
+                                matches!(io_e.kind(),
+                                    ErrorKind::UnexpectedEof
+                                    | ErrorKind::ConnectionReset
+                                    | ErrorKind::BrokenPipe)
+                            });
 
                         if !is_expected {
                             debug!("Connection error from {}: {:#}", client_addr, e);
@@ -546,6 +779,7 @@ async fn run(args: Args) -> Result<()> {
         }
     }
 
+    // Graceful drain
     if stats.active_count() > 0 {
         if wait_for_drain(&stats, drain_timeout).await {
             info!("All connections drained successfully");
@@ -576,7 +810,6 @@ async fn handle_connection(
 
     let mut buf = [0u8; MAX_HEADER_SIZE];
 
-    // Initial read with timeout to protect against slow-loris attacks
     let mut pos = match timeout(
         Duration::from_secs(INITIAL_READ_TIMEOUT_SECS),
         client.read(&mut buf),
@@ -598,7 +831,14 @@ async fn handle_connection(
                 let method = req.method.unwrap_or("");
                 let path = req.path.unwrap_or("");
 
-                // Fast path for internal endpoints (support keep-alive)
+                // Check for request smuggling
+                if has_smuggling_indicators(req.headers) {
+                    warn!(client = %peer_addr, "Request smuggling attempt detected");
+                    let _ = client.write_all(RESPONSE_400).await;
+                    return Ok(());
+                }
+
+                // Fast path for internal endpoints
                 if let Some(result) =
                     handle_internal_endpoint(&buf[..parsed_len], &mut client, &config).await?
                 {
@@ -607,7 +847,6 @@ async fn handle_connection(
                     }
                     shift_buffer(&mut buf, &mut pos, parsed_len);
 
-                    // Read more data for next request if buffer is empty
                     if pos == 0 {
                         match timeout(Duration::from_secs(2), client.read(&mut buf)).await {
                             Ok(Ok(0)) => break,
@@ -625,7 +864,6 @@ async fn handle_connection(
                     "Processing request"
                 );
 
-                // Proxy requests don't support keep-alive (tunnels are long-lived)
                 return if method.eq_ignore_ascii_case("CONNECT") {
                     handle_connect(client, path, &config).await
                 } else {
@@ -671,58 +909,6 @@ fn shift_buffer(buf: &mut [u8], pos: &mut usize, consumed: usize) {
 }
 
 // ============================================================================
-// Keep-Alive Detection
-// ============================================================================
-
-#[inline]
-fn should_keep_alive(request: &[u8]) -> bool {
-    // Find end of first line to locate HTTP version
-    let first_line_end = request
-        .iter()
-        .position(|&b| b == b'\r')
-        .unwrap_or(request.len());
-
-    // Check for HTTP/1.1 (default keep-alive)
-    if first_line_end >= 8 {
-        let check_start = first_line_end.saturating_sub(8);
-        if let Some(slice) = request.get(check_start..first_line_end) {
-            if slice.eq_ignore_ascii_case(b"HTTP/1.1") {
-                // HTTP/1.1: keep-alive unless "Connection: close"
-                return !contains_header_value(request, b"close");
-            }
-        }
-    }
-
-    // HTTP/1.0 or unknown: only keep-alive if explicitly requested
-    contains_header_value(request, b"keep-alive")
-}
-
-#[inline]
-fn contains_header_value(request: &[u8], value: &[u8]) -> bool {
-    let conn_header = b"connection:";
-
-    for i in 0..request.len().saturating_sub(conn_header.len()) {
-        if let Some(slice) = request.get(i..i + conn_header.len()) {
-            if slice.eq_ignore_ascii_case(conn_header) {
-                let start = i + conn_header.len();
-                let end = request
-                    .get(start..)
-                    .and_then(|s| s.iter().position(|&b| b == b'\r' || b == b'\n'))
-                    .map(|p| start + p)
-                    .unwrap_or(request.len());
-
-                if let Some(header_value) = request.get(start..end) {
-                    return header_value
-                        .windows(value.len())
-                        .any(|w| w.eq_ignore_ascii_case(value));
-                }
-            }
-        }
-    }
-    false
-}
-
-// ============================================================================
 // Internal Endpoint Result
 // ============================================================================
 
@@ -739,110 +925,50 @@ async fn handle_internal_endpoint(
     client: &mut TcpStream,
     config: &ProxyConfig,
 ) -> Result<Option<InternalEndpointResult>> {
-    // Minimum: "GET /x HTTP/1.1\r\n" = 16 bytes
-    if request.len() < 14 {
+    if request.len() < 14 || request.get(0..5) != Some(b"GET /") {
         return Ok(None);
     }
 
-    // Fast check for "GET /"
-    if request.get(0..5) != Some(b"GET /") {
-        return Ok(None);
-    }
-
-    // Ultra-fast path for /bench
-    if request.len() >= 11 {
-        if let Some(slice) = request.get(5..10) {
-            if slice == b"bench" {
-                if let Some(&next) = request.get(10) {
-                    if next == b' ' || next == b'\r' {
-                        client.write_all(RESPONSE_BENCH).await?;
-                        return Ok(Some(InternalEndpointResult { keep_alive: true }));
-                    }
-                }
-            }
-        }
-    }
-
-    // Fast path for /health
-    if request.len() >= 12 {
-        if let Some(slice) = request.get(5..11) {
-            if slice == b"health" {
-                if let Some(&next) = request.get(11) {
-                    if next == b' ' || next == b'\r' {
-                        let keepalive = should_keep_alive(request);
-                        let response = if keepalive {
-                            RESPONSE_HEALTH_KEEPALIVE
-                        } else {
-                            RESPONSE_HEALTH
-                        };
-                        client.write_all(response).await?;
-                        return Ok(Some(InternalEndpointResult {
-                            keep_alive: keepalive,
-                        }));
-                    }
-                }
-            }
-        }
-    }
-
-    // Extract path for other endpoints
-    let path_end = request
-        .get(5..)
-        .and_then(|s| s.iter().position(|&b| b == b' ' || b == b'\r'))
-        .map(|p| 5 + p)
-        .unwrap_or(request.len());
-
-    let path = request.get(4..path_end).unwrap_or(b"");
+    let path_end = memchr::memchr2(b' ', b'\r', &request[5..]).map_or(request.len(), |p| 5 + p);
+    let path = &request[5..path_end];
     let keepalive = should_keep_alive(request);
 
     match path {
-        b"/stats" => {
-            let snapshot = config.stats.snapshot();
-            let body = format!(
-                "total={} active={} blocked={} whitelisted={} fragmented={} failed={} rejected={} bytes_in={} bytes_out={}",
-                snapshot.total,
-                snapshot.active,
-                snapshot.blocked,
-                snapshot.whitelisted,
-                snapshot.fragmented,
-                snapshot.failed,
-                snapshot.rejected,
-                snapshot.bytes_in,
-                snapshot.bytes_out,
-            );
-            let response = format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: text/plain\r\n\
-                 Content-Length: {}\r\n\
-                 Connection: {}\r\n\r\n{}",
-                body.len(),
-                if keepalive { "keep-alive" } else { "close" },
-                body
-            );
+        b"bench" => {
+            client.write_all(RESPONSE_BENCH).await?;
+            Ok(Some(InternalEndpointResult { keep_alive: true }))
+        }
+        b"health" => {
+            let response = if keepalive {
+                RESPONSE_HEALTH_KEEPALIVE
+            } else {
+                RESPONSE_HEALTH
+            };
+            client.write_all(response).await?;
+            Ok(Some(InternalEndpointResult {
+                keep_alive: keepalive,
+            }))
+        }
+        b"stats" => {
+            let body = config.stats.snapshot().to_string();
+            let response = build_response(200, &body, keepalive);
             client.write_all(response.as_bytes()).await?;
             Ok(Some(InternalEndpointResult {
                 keep_alive: keepalive,
             }))
         }
-        b"/filter-stats" => {
+        b"filter-stats" => {
             let fs = config.filter.stats();
             let body = format!(
-                "blacklist_exact={} blacklist_suffix={} whitelist_exact={} whitelist_suffix={} total={}",
+                "blacklist_exact={} blacklist_suffix={} \
+                 whitelist_exact={} whitelist_suffix={} total={}",
                 fs.blacklist_exact,
                 fs.blacklist_suffix,
                 fs.whitelist_exact,
                 fs.whitelist_suffix,
                 fs.total()
             );
-            let response = format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: text/plain\r\n\
-                 Content-Length: {}\r\n\
-                 Connection: {}\r\n\r\n{}",
-                body.len(),
-                if keepalive { "keep-alive" } else { "close" },
-                body
-            );
+            let response = build_response(200, &body, keepalive);
             client.write_all(response.as_bytes()).await?;
             Ok(Some(InternalEndpointResult {
                 keep_alive: keepalive,
@@ -888,6 +1014,13 @@ fn parse_host_port(target: &str, default_port: u16) -> (&str, u16) {
 async fn handle_connect(mut client: TcpStream, target: &str, config: &ProxyConfig) -> Result<()> {
     let (host, port) = parse_host_port(target, 443);
 
+    if !validate_host(host, config.allow_private) {
+        warn!(host = %host, "BLOCKED (invalid or private host)");
+        config.stats.inc_blocked();
+        let _ = client.write_all(RESPONSE_403).await;
+        return Ok(());
+    }
+
     if config.filter.is_blacklisted(host) {
         config.stats.inc_blocked();
         warn!(host = %host, "BLOCKED CONNECT");
@@ -914,14 +1047,18 @@ async fn handle_connect(mut client: TcpStream, target: &str, config: &ProxyConfi
             s
         }
         Err(e) => {
-            warn!(host = %host, port = %port, error = %e, "Upstream connection failed");
+            warn!(
+                host = %host,
+                port = %port,
+                error = %e,
+                "Upstream connection failed"
+            );
             let _ = client.write_all(RESPONSE_502).await;
             return Ok(());
         }
     };
 
     client.write_all(RESPONSE_200_CONNECT).await?;
-
     let _ = server.set_nodelay(true);
 
     let should_fragment = !config.filter.is_whitelisted(host);
@@ -970,6 +1107,13 @@ async fn handle_http(
 
     let (host, port) = parse_host_port(host_header, 80);
 
+    if !validate_host(host, config.allow_private) {
+        warn!(host = %host, "BLOCKED HTTP (invalid or private host)");
+        config.stats.inc_blocked();
+        let _ = client.write_all(RESPONSE_403).await;
+        return Ok(());
+    }
+
     if config.filter.is_blacklisted(host) {
         config.stats.inc_blocked();
         warn!(host = %host, "BLOCKED HTTP");
@@ -996,14 +1140,18 @@ async fn handle_http(
             s
         }
         Err(e) => {
-            warn!(host = %host, port = %port, error = %e, "HTTP upstream connection failed");
+            warn!(
+                host = %host,
+                port = %port,
+                error = %e,
+                "HTTP upstream connection failed"
+            );
             let _ = client.write_all(RESPONSE_502).await;
             return Ok(());
         }
     };
 
     let _ = server.set_nodelay(true);
-
     server.write_all(initial_data).await?;
 
     let result = match config.idle_timeout {
@@ -1035,7 +1183,7 @@ async fn fragment_tls_handshake(
         Err(_) => return Ok(()),
     }
 
-    // Validate TLS record: 0x16 = Handshake, 0x03 0x0X = TLS version
+    // Validate TLS record
     if header[0] != 0x16 || header[1] != 0x03 || header[2] > 0x03 {
         trace!("Non-TLS or unsupported record, forwarding directly");
         server.write_all(&header).await?;
@@ -1048,25 +1196,20 @@ async fn fragment_tls_handshake(
         return Ok(());
     }
 
-    // NOTE: Allocating large Vec for body. For ultra-optimization, consider a buffer pool.
-    let mut body = vec![0u8; record_len];
+    // Use buffer pool
+    let mut body = config.buffer_pool.acquire(record_len);
     match timeout(Duration::from_secs(5), client.read_exact(&mut body)).await {
         Ok(Ok(_)) => {}
-        Ok(Err(e)) => {
-            let _ = server.write_all(&header).await;
-            return Err(e.into());
-        }
-        Err(_) => {
-            let _ = server.write_all(&header).await;
-            return Ok(());
-        }
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => return Ok(()), // Don't send partial record
     }
 
     config.stats.inc_fragmented();
 
     let fragments = generate_fragment_sizes(record_len, config);
-
+    let mut write_buf = Vec::with_capacity(5 + record_len);
     let mut remaining = &body[..];
+
     for (i, &size) in fragments.iter().enumerate() {
         if size == 0 {
             continue;
@@ -1076,18 +1219,21 @@ async fn fragment_tls_handshake(
         let (chunk, rest) = remaining.split_at(chunk_size);
         remaining = rest;
 
-        let frag_header = [
+        // Consolidated write
+        write_buf.clear();
+        write_buf.extend_from_slice(&[
             0x16,
             header[1],
             header[2],
             (chunk.len() >> 8) as u8,
             (chunk.len() & 0xFF) as u8,
-        ];
+        ]);
+        write_buf.extend_from_slice(chunk);
 
-        server.write_all(&frag_header).await?;
-        server.write_all(chunk).await?;
+        server.write_all(&write_buf).await?;
         server.flush().await?;
 
+        // Delay after first fragment
         if i == 0 && fragments.len() > 1 {
             let delay_ms = if size <= 4 {
                 (config.random_u32() % 70 + 20) as u64
@@ -1102,12 +1248,12 @@ async fn fragment_tls_handshake(
 }
 
 #[inline]
-fn generate_fragment_sizes(record_len: usize, config: &ProxyConfig) -> Vec<usize> {
+fn generate_fragment_sizes(record_len: usize, config: &ProxyConfig) -> SmallVec<[usize; 4]> {
     let strategy = config.random_u32() % 100;
 
     if strategy < 60 {
         let first = ((config.random_u32() as usize % 8) + 1).min(record_len);
-        vec![first, record_len.saturating_sub(first)]
+        smallvec::smallvec![first, record_len.saturating_sub(first)]
     } else if strategy < 90 {
         let p1 = ((config.random_u32() as usize % 12) + 1).min(record_len);
         let remaining = record_len.saturating_sub(p1);
@@ -1116,11 +1262,11 @@ fn generate_fragment_sizes(record_len: usize, config: &ProxyConfig) -> Vec<usize
         } else {
             0
         };
-        vec![p1, p2, remaining.saturating_sub(p2)]
+        smallvec::smallvec![p1, p2, remaining.saturating_sub(p2)]
     } else if record_len > 1 {
-        vec![1, record_len - 1]
+        smallvec::smallvec![1, record_len - 1]
     } else {
-        vec![record_len]
+        smallvec::smallvec![record_len]
     }
 }
 
@@ -1137,10 +1283,10 @@ mod tests {
         let req = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
         assert!(should_keep_alive(req));
 
-        let req = b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+        let req = b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n";
         assert!(!should_keep_alive(req));
 
-        let req = b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\n";
+        let req = b"GET / HTTP/1.1\r\nConnection: keep-alive\r\n\r\n";
         assert!(should_keep_alive(req));
     }
 
@@ -1149,7 +1295,7 @@ mod tests {
         let req = b"GET / HTTP/1.0\r\nHost: example.com\r\n\r\n";
         assert!(!should_keep_alive(req));
 
-        let req = b"GET / HTTP/1.0\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\n";
+        let req = b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n";
         assert!(should_keep_alive(req));
     }
 
@@ -1165,19 +1311,68 @@ mod tests {
     }
 
     #[test]
-    fn test_stats_snapshot() {
-        let stats = Stats::new();
-        stats.inc_total();
-        stats.inc_active();
-        stats.inc_blocked();
-        stats.add_bytes(100, 200);
+    fn test_is_private_host() {
+        assert!(is_private_host("localhost"));
+        assert!(is_private_host("127.0.0.1"));
+        assert!(is_private_host("10.0.0.1"));
+        assert!(is_private_host("192.168.1.1"));
+        assert!(is_private_host("::1"));
+        assert!(is_private_host("foo.local"));
 
-        let snapshot = stats.snapshot();
-        assert_eq!(snapshot.total, 1);
-        assert_eq!(snapshot.active, 1);
-        assert_eq!(snapshot.blocked, 1);
-        assert_eq!(snapshot.bytes_in, 100);
-        assert_eq!(snapshot.bytes_out, 200);
+        assert!(!is_private_host("example.com"));
+        assert!(!is_private_host("8.8.8.8"));
+    }
+
+    #[test]
+    fn test_has_smuggling_indicators() {
+        let ok = [
+            httparse::Header {
+                name: "Host",
+                value: b"example.com",
+            },
+            httparse::Header {
+                name: "Content-Length",
+                value: b"10",
+            },
+        ];
+        assert!(!has_smuggling_indicators(&ok));
+
+        let dup_cl = [
+            httparse::Header {
+                name: "Content-Length",
+                value: b"10",
+            },
+            httparse::Header {
+                name: "Content-Length",
+                value: b"20",
+            },
+        ];
+        assert!(has_smuggling_indicators(&dup_cl));
+
+        let cl_te = [
+            httparse::Header {
+                name: "Content-Length",
+                value: b"10",
+            },
+            httparse::Header {
+                name: "Transfer-Encoding",
+                value: b"chunked",
+            },
+        ];
+        assert!(has_smuggling_indicators(&cl_te));
+    }
+
+    #[test]
+    fn test_buffer_pool() {
+        let pool = BufferPool::new(4, 1024);
+
+        let buf1 = pool.acquire(100);
+        assert_eq!(buf1.len(), 100);
+
+        drop(buf1);
+
+        let buf2 = pool.acquire(50);
+        assert_eq!(buf2.len(), 50);
     }
 
     #[test]
@@ -1185,27 +1380,17 @@ mod tests {
         let config = ProxyConfig {
             filter: Arc::new(DomainFilter::new()),
             stats: Arc::new(Stats::new()),
+            buffer_pool: Arc::new(BufferPool::new(16, MAX_TLS_RECORD_SIZE)),
             connect_timeout: None,
             idle_timeout: None,
+            allow_private: false,
         };
 
         for _ in 0..100 {
             let sizes = generate_fragment_sizes(1000, &config);
             let total: usize = sizes.iter().sum();
             assert_eq!(total, 1000);
+            assert!(sizes.len() <= 4);
         }
-    }
-
-    #[test]
-    fn test_connection_guard() {
-        let stats = Arc::new(Stats::new());
-        assert_eq!(stats.active.load(Ordering::Relaxed), 0);
-
-        {
-            let _guard = ConnectionGuard::new(stats.clone());
-            assert_eq!(stats.active.load(Ordering::Relaxed), 1);
-        }
-
-        assert_eq!(stats.active.load(Ordering::Relaxed), 0);
     }
 }

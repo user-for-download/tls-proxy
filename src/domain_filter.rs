@@ -24,14 +24,13 @@ pub struct FilterStats {
 }
 
 impl FilterStats {
-    /// Total number of rules across all lists.
     #[must_use]
     pub fn total(&self) -> usize {
         self.blacklist_exact + self.blacklist_suffix + self.whitelist_exact + self.whitelist_suffix
     }
 }
 
-/// A thread-safe domain filter supporting exact and suffix (wildcard) matching.
+/// Thread-safe domain filter with exact and suffix matching.
 pub struct DomainFilter {
     blacklist: Arc<RwLock<DomainSet>>,
     whitelist: Arc<RwLock<DomainSet>>,
@@ -44,7 +43,6 @@ impl Default for DomainFilter {
 }
 
 impl DomainFilter {
-    /// Creates a new empty domain filter.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -53,21 +51,18 @@ impl DomainFilter {
         }
     }
 
-    /// Loads a blacklist from a file, replacing any existing blacklist.
     pub fn load_blacklist(&self, path: impl AsRef<Path>) -> Result<()> {
         let new_list = Self::load(path.as_ref(), "blacklist")?;
         *self.blacklist.write() = new_list;
         Ok(())
     }
 
-    /// Loads a whitelist from a file, replacing any existing whitelist.
     pub fn load_whitelist(&self, path: impl AsRef<Path>) -> Result<()> {
         let new_list = Self::load(path.as_ref(), "whitelist")?;
         *self.whitelist.write() = new_list;
         Ok(())
     }
 
-    /// Returns statistics about loaded filter rules.
     #[must_use]
     pub fn stats(&self) -> FilterStats {
         let bl = self.blacklist.read();
@@ -80,7 +75,6 @@ impl DomainFilter {
         }
     }
 
-    /// Checks if a domain is in the blacklist.
     #[must_use]
     pub fn is_blacklisted(&self, domain: &str) -> bool {
         if domain.is_empty() || !domain.is_ascii() {
@@ -101,7 +95,6 @@ impl DomainFilter {
         matched
     }
 
-    /// Checks if a domain is in the whitelist.
     #[must_use]
     pub fn is_whitelisted(&self, domain: &str) -> bool {
         if domain.is_empty() || !domain.is_ascii() {
@@ -188,7 +181,8 @@ impl DomainFilter {
         let domain_set = DomainSet { exact, suffix_trie };
 
         info!(
-            "Loaded {}: {} valid rules from {} lines ({} exact, {} suffix, {} invalid)",
+            "Loaded {}: {} valid rules from {} lines \
+             ({} exact, {} suffix, {} invalid)",
             name,
             valid_count,
             raw_count,
@@ -203,18 +197,13 @@ impl DomainFilter {
     fn parse_domain_line(line: &str) -> Option<ParsedDomain> {
         let mut domain = line.trim();
 
-        // Skip empty lines and comments
         if domain.is_empty() || domain.starts_with('#') || domain.starts_with("//") {
             return None;
         }
 
-        // Handle adblock-style exception syntax
         domain = domain.strip_prefix("@@").unwrap_or(domain);
-
-        // Handle adblock-style domain anchor
         domain = domain.strip_prefix("||").unwrap_or(domain);
 
-        // Strip URL schemes
         for scheme in ["https://", "http://", "wss://", "ws://"] {
             if let Some(rest) = domain.strip_prefix(scheme) {
                 domain = rest;
@@ -222,18 +211,12 @@ impl DomainFilter {
             }
         }
 
-        // Remove path, port, query, and fragment
         if let Some(idx) = domain.find(&['/', ':', '?', '#'][..]) {
             domain = &domain[..idx];
         }
 
-        // Take only the first whitespace-delimited token
         domain = domain.split_whitespace().next()?;
-
-        // Remove trailing dots
         domain = domain.trim_end_matches('.');
-
-        // Strip www prefix
         domain = domain.strip_prefix("www.").unwrap_or(domain);
 
         if domain.is_empty() {
@@ -242,7 +225,6 @@ impl DomainFilter {
 
         let domain_lower = domain.to_ascii_lowercase();
 
-        // Determine if this is a suffix (wildcard) rule
         if let Some(d) = domain_lower.strip_prefix("*.") {
             Some(ParsedDomain::Suffix(d.to_string()))
         } else if let Some(d) = domain_lower.strip_prefix('.') {
@@ -271,7 +253,6 @@ impl Default for DomainSet {
 }
 
 impl DomainSet {
-    /// Check with reason tracking for debugging.
     fn matches_with_reason(&self, domain: &str) -> (bool, Option<String>) {
         if self.exact.contains(domain) {
             return (true, Some("Exact Match".to_string()));
@@ -283,12 +264,10 @@ impl DomainSet {
             if let Some(subtrie) = self.suffix_trie.get_ancestor(&reversed) {
                 let key = subtrie.key().unwrap();
 
-                // Case 1: Exact match on the suffix
                 if key.len() == reversed.len() {
                     return (true, Some("Exact Suffix Match".to_string()));
                 }
 
-                // Case 2: Subdomain match - check for dot boundary
                 if reversed.as_bytes().get(key.len()) == Some(&b'.') {
                     let matched_suffix: String = key.chars().rev().collect();
                     return (true, Some(format!("Suffix Match: *.{}", matched_suffix)));
@@ -306,19 +285,16 @@ enum ParsedDomain {
     Suffix(String),
 }
 
-/// Reverses a domain string safely.
 #[inline]
 fn reverse_domain(domain: &str) -> String {
     domain.chars().rev().collect()
 }
 
-/// Validates a domain according to DNS naming rules.
 fn is_valid_domain(domain: &str) -> bool {
     if domain.is_empty() || domain.len() > MAX_DOMAIN_LENGTH {
         return false;
     }
 
-    // Must be ASCII
     if !domain.is_ascii() {
         return false;
     }
@@ -365,7 +341,7 @@ mod tests {
         assert!(!is_valid_domain(".example.com"));
         assert!(!is_valid_domain("example..com"));
         assert!(!is_valid_domain("-example.com"));
-        assert!(!is_valid_domain("café.com")); // non-ASCII
+        assert!(!is_valid_domain("café.com"));
     }
 
     #[test]
