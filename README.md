@@ -14,8 +14,51 @@ A high-performance, asynchronous HTTP/HTTPS proxy written in Rust.
 Ensure you have Rust installed.
 
 ```bash
-# Build for release (optimized)
 cargo build --release
+```
+
+## Usage
+### Command Line Arguments
+
+| Argument | Default | Description |
+| :--- | :--- | :--- |
+| `--host` | `0.0.0.0` | IP address to bind to. |
+| `--port` | `8101` | Port to listen on. |
+| `--blacklist` | `None` | Path to a file containing domains to block (returns 403). |
+| `--whitelist` | `None` | Path to a file containing domains to **exclude** from TLS fragmentation. |
+| `--timeout-connect` | `10` | Connection timeout in seconds. |
+| `--timeout-idle` | `60` | Idle connection timeout in seconds. |
+| `--stats-interval` | `60` | Seconds between printing stats to stdout. |
+| `--max-connections` | `10000` | Maximum number of concurrent connections. |
+| `--drain-timeout` | `30` | Graceful shutdown drain timeout in seconds. |
+| `--log-level` | `info` | Logging level (`trace`, `debug`, `info`, `warn`, `error`). |
+| `--allow-private` | `false` | Allow connections to private/internal IP ranges (e.g., 10.x.x.x, 192.168.x.x). |
+
+
+
+Run the binary from the target directory:
+```bash
+ ./target/release/tls-proxy --help                                                                                                                                                                                 
+High-performance HTTPS proxy with TLS fragmentation
+
+Options:
+      --host <HOST>                        [default: 0.0.0.0]
+      --port <PORT>                        [default: 8101]
+      --blacklist <BLACKLIST>              
+      --whitelist <WHITELIST>              
+      --timeout-connect <TIMEOUT_CONNECT>  [default: 10]
+      --timeout-idle <TIMEOUT_IDLE>        [default: 60]
+      --stats-interval <STATS_INTERVAL>    [default: 60]
+      --max-connections <MAX_CONNECTIONS>  [default: 10000]
+      --drain-timeout <DRAIN_TIMEOUT>      [default: 30]
+      --log-level <LOG_LEVEL>              [default: info]
+      --allow-private                      Allow connections to private/internal IP ranges
+  -h, --help                               Print help
+  -V, --version                            Print version
+```
+### Example 
+```bash
+./target/release/tls-proxy --host 0.0.0.0 --port 8101 --blacklist ./blacklist.txt --whitelist ./whitelist.txt --timeout-connect 10 --timeout-idle 60 --max-connections 10000 --stats-interval 60 --log-level debug
 ```
 ```bash
 oha -c 400 -n 1000000 http://127.0.0.1:8101/bench
@@ -46,25 +89,6 @@ Status code distribution:
   [200] 1000000 responses
 
 ```
-
-## Usage
-
-Run the binary from the target directory:
-
-```bash
-./target/release/tls-proxy --blacklist blacklist.txt --whitelist whitelist.txt
-```
-
-### Command Line Arguments
-
-| Argument | Default | Description |
-| :--- | :--- | :--- |
-| `--host` | `0.0.0.0` | IP address to bind to. |
-| `--port` | `8101` | Port to listen on. |
-| `--blacklist` | `None` | Path to a file containing domains to block (returns 403). |
-| `--whitelist` | `None` | Path to a file containing domains to **exclude** from TLS fragmentation. |
-| `--log-level` | `info` | Logging level (`trace`, `debug`, `info`, `warn`, `error`). |
-| `--stats-interval`| `60` | Seconds between printing stats to stdout. |
 
 ## Filter List Syntax
 

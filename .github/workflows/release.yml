@@ -127,22 +127,23 @@ jobs:
           name: tls-proxy-macos-arm64
           path: dist/tls-proxy-macos-arm64
 
-  # 2. New Job: Create Release
   create-release:
-    needs: [build-linux, build-windows, build-macos]
+    needs: [ build-linux, build-windows, build-macos ]
     runs-on: ubuntu-latest
-    # FIX: Remove '!env.ACT'. The 'env' context is not available here.
     if: startsWith(github.ref, 'refs/tags/')
     steps:
       - name: Download all artifacts
+        if: ${{ !env.ACT }}
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
       - name: Display structure of downloaded files
+        if: ${{ !env.ACT }}
         run: ls -R artifacts
 
       - name: Create Release
+        if: ${{ !env.ACT }}
         uses: softprops/action-gh-release@v1
         with:
           files: |
