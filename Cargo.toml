@@ -1,0 +1,46 @@
+[package]
+name = "tls-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "signal", "sync", "macros", "rt"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# Error handling
+anyhow = "1"
+
+# Fast domain routing
+radix_trie = "0.3.0"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# HTTP parsing
+httparse = "1"
+
+# Fast hashing & collections
+smallvec = "1"
+
+# Concurrency
+parking_lot = "0.12"
+
+# Random
+rand = { version = "0.10.0", features = ["small_rng"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Linux-specific
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release.build-override]
+opt-level = 3

@@ -1,0 +1,163 @@
+name: Build Release
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: tls-proxy
+
+permissions:
+  contents: write
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Tests (runs on every push/PR)
+  # ──────────────────────────────────────────────
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-test-
+
+      - name: Run tests
+        run: cargo test --verbose
+
+      - name: Run clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+  # ──────────────────────────────────────────────
+  # Linux x64
+  # ──────────────────────────────────────────────
+  build-linux:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-linux-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-linux-
+
+      - name: Build
+        run: |
+          cargo build --release
+          mkdir -p dist
+          cp target/release/${BINARY_NAME} dist/${BINARY_NAME}-linux-x64
+          strip dist/${BINARY_NAME}-linux-x64
+          chmod +x dist/${BINARY_NAME}-linux-x64
+          cd dist && sha256sum ${BINARY_NAME}-linux-x64 > ${BINARY_NAME}-linux-x64.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-linux-x64
+          path: |
+            dist/${{ env.BINARY_NAME }}-linux-x64
+            dist/${{ env.BINARY_NAME }}-linux-x64.sha256
+
+  # ──────────────────────────────────────────────
+  # Linux ARM64
+  # ──────────────────────────────────────────────
+  build-linux-arm64:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-linux-arm64-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-linux-arm64-
+
+      - name: Install cross-compilation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          rustup target add aarch64-unknown-linux-gnu
+
+      - name: Build
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          cargo build --release --target aarch64-unknown-linux-gnu
+          mkdir -p dist
+          cp target/aarch64-unknown-linux-gnu/release/${BINARY_NAME} dist/${BINARY_NAME}-linux-arm64
+          aarch64-linux-gnu-strip dist/${BINARY_NAME}-linux-arm64 || true
+          chmod +x dist/${BINARY_NAME}-linux-arm64
+          cd dist && sha256sum ${BINARY_NAME}-linux-arm64 > ${BINARY_NAME}-linux-arm64.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-linux-arm64
+          path: |
+            dist/${{ env.BINARY_NAME }}-linux-arm64
+            dist/${{ env.BINARY_NAME }}-linux-arm64.sha256
+
+  # ──────────────────────────────────────────────
+  # Create GitHub Release (only on tag push)
+  # ──────────────────────────────────────────────
+  create-release:
+    needs: [build-linux, build-linux-arm64]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f | sort
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Release ${{ steps.version.outputs.version }}"
+          generate_release_notes: true
+          files: |
+            artifacts/tls-proxy-linux-x64/*
+            artifacts/tls-proxy-linux-arm64/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
