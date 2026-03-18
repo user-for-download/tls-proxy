@@ -1,4 +1,4 @@
-#![warn(clippy::all, clippy::pedantic)]
+#![warn(clippy::all)]
 #![allow(clippy::similar_names, clippy::module_name_repetitions)]
 
 mod domain_filter;
@@ -17,7 +17,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -90,14 +90,14 @@ fn optimize_socket_linux(fd: RawFd, is_listener: bool) {
             fd,
             libc::IPPROTO_TCP,
             libc::TCP_NODELAY,
-            &one as *const _ as _,
+            (&raw const one).cast(),
             std::mem::size_of::<i32>() as u32,
         );
         libc::setsockopt(
             fd,
             libc::IPPROTO_TCP,
             libc::TCP_QUICKACK,
-            &one as *const _ as _,
+            (&raw const one).cast(),
             std::mem::size_of::<i32>() as u32,
         );
 
@@ -108,14 +108,14 @@ fn optimize_socket_linux(fd: RawFd, is_listener: bool) {
                 fd,
                 libc::IPPROTO_TCP,
                 libc::TCP_DEFER_ACCEPT,
-                &defer as *const _ as _,
+                (&raw const defer).cast(),
                 std::mem::size_of::<i32>() as u32,
             );
             libc::setsockopt(
                 fd,
                 libc::IPPROTO_TCP,
                 libc::TCP_FASTOPEN,
-                &fastopen as *const _ as _,
+                (&raw const fastopen).cast(),
                 std::mem::size_of::<i32>() as u32,
             );
         }
@@ -126,14 +126,14 @@ fn optimize_socket_linux(fd: RawFd, is_listener: bool) {
             fd,
             libc::SOL_SOCKET,
             libc::SO_BUSY_POLL,
-            &busy_poll as *const _ as _,
+            (&raw const busy_poll).cast(),
             std::mem::size_of::<i32>() as u32,
         );
         libc::setsockopt(
             fd,
             libc::IPPROTO_TCP,
             libc::TCP_NOTSENT_LOWAT,
-            &lowat as *const _ as _,
+            (&raw const lowat).cast(),
             std::mem::size_of::<i32>() as u32,
         );
     }
@@ -146,7 +146,7 @@ fn set_tcp_congestion(fd: RawFd, algo: &str) {
             fd,
             libc::IPPROTO_TCP,
             libc::TCP_CONGESTION,
-            algo.as_ptr() as _,
+            algo.as_ptr().cast(),
             algo.len() as u32,
         );
     }
@@ -288,7 +288,7 @@ fn set_cpu_affinity(cpu_id: usize) {
         let mut cpuset: libc::cpu_set_t = zeroed();
         libc::CPU_ZERO(&mut cpuset);
         libc::CPU_SET(cpu_id % libc::CPU_SETSIZE as usize, &mut cpuset);
-        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpuset);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw const cpuset);
     }
 }
 
@@ -533,7 +533,7 @@ fn main() -> Result<()> {
         .init();
 
     let workers = if args.workers == 0 {
-        std::thread::available_parallelism().map_or(1, |n| n.get())
+        std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
     } else {
         args.workers
     };
@@ -560,9 +560,9 @@ fn main() -> Result<()> {
 fn tune_system() {
     unsafe {
         let mut rlim: libc::rlimit = zeroed();
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut rlim) == 0 {
             rlim.rlim_cur = rlim.rlim_max;
-            libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+            libc::setrlimit(libc::RLIMIT_NOFILE, &raw const rlim);
         }
     }
 }
@@ -621,10 +621,7 @@ async fn run(args: Args) -> Result<()> {
                         continue;
                     }
                 };
-                let permit = match semaphore.clone().try_acquire_owned() {
-                    Ok(p) => p,
-                    Err(_) => { stats.inc_rejected(); drop(client_stream); continue; }
-                };
+                let permit = if let Ok(p) = semaphore.clone().try_acquire_owned() { p } else { stats.inc_rejected(); drop(client_stream); continue; };
 
                 let fd = client_stream.as_raw_fd();
                 optimize_socket_linux(fd, false);
@@ -636,7 +633,7 @@ async fn run(args: Args) -> Result<()> {
                     let _guard = ConnectionGuard::new(config.stats.clone());
                     if let Err(e) = handle_connection(client_stream, client_addr, config.clone()).await {
                         let is_expected = e.downcast_ref::<std::io::Error>()
-                            .map_or(false, |io_e| matches!(io_e.kind(), ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::BrokenPipe));
+                            .is_some_and(|io_e| matches!(io_e.kind(), ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::BrokenPipe));
                         if !is_expected { config.stats.inc_failed(); }
                     }
                 });
@@ -674,14 +671,14 @@ fn create_listener(args: &Args) -> Result<TcpListener> {
             fd,
             libc::SOL_SOCKET,
             libc::SO_REUSEADDR,
-            &one as *const _ as _,
+            (&raw const one).cast(),
             4,
         );
         libc::setsockopt(
             fd,
             libc::SOL_SOCKET,
             libc::SO_REUSEPORT,
-            &one as *const _ as _,
+            (&raw const one).cast(),
             4,
         );
         let addr_in = libc::sockaddr_in {
@@ -692,7 +689,7 @@ fn create_listener(args: &Args) -> Result<TcpListener> {
         };
         if libc::bind(
             fd,
-            &addr_in as *const _ as _,
+            (&raw const addr_in).cast(),
             std::mem::size_of::<libc::sockaddr_in>() as u32,
         ) < 0
         {
@@ -840,7 +837,7 @@ async fn handle_connect(
             .map_err(|_| std::io::Error::new(ErrorKind::TimedOut, ""))?,
         None => TcpStream::connect((host, port)).await,
     }
-    .map_err(|_| std::io::Error::new(ErrorKind::Other, "upstream failed"))?;
+    .map_err(|_| std::io::Error::other("upstream failed"))?;
 
     let server_fd = server.as_raw_fd();
     optimize_socket_linux(server_fd, false);
@@ -850,9 +847,7 @@ async fn handle_connect(
 
     client.write_all(RESPONSE_200_CONNECT).await?;
 
-    if !leftover_data.is_empty() {
-        server.write_all(leftover_data).await?;
-    } else {
+    if leftover_data.is_empty() {
         let should_fragment = !config.filter.is_whitelisted(host);
         if should_fragment {
             if let Err(e) = fragment_tls_handshake(&mut client, &mut server, config).await {
@@ -861,6 +856,8 @@ async fn handle_connect(
         } else {
             config.stats.inc_whitelisted();
         }
+    } else {
+        server.write_all(leftover_data).await?;
     }
 
     let result = if config.use_splice {
@@ -913,12 +910,9 @@ async fn handle_http(
         None => TcpStream::connect((host, port)).await,
     };
 
-    let mut server = match server_res {
-        Ok(s) => s,
-        Err(_) => {
-            let _ = client.write_all(RESPONSE_502).await;
-            return Ok(());
-        }
+    let mut server = if let Ok(s) = server_res { s } else {
+        let _ = client.write_all(RESPONSE_502).await;
+        return Ok(());
     };
 
     optimize_socket_linux(server.as_raw_fd(), false);
@@ -997,7 +991,7 @@ async fn fragment_tls_handshake(
         server.flush().await?;
 
         if i == 0 && fragments.len() > 1 {
-            let delay = (config.random_u32() % 50 + 10) as u64;
+            let delay = u64::from(config.random_u32() % 50 + 10);
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
     }
