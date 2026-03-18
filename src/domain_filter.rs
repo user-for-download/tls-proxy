@@ -15,21 +15,6 @@ const BUFFER_SIZE: usize = 256 * 1024;
 const MAX_DOMAIN_LENGTH: usize = 253;
 const MAX_LABEL_LENGTH: usize = 63;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FilterStats {
-    pub blacklist_exact: usize,
-    pub blacklist_suffix: usize,
-    pub whitelist_exact: usize,
-    pub whitelist_suffix: usize,
-}
-
-impl FilterStats {
-    #[must_use]
-    pub fn total(&self) -> usize {
-        self.blacklist_exact + self.blacklist_suffix + self.whitelist_exact + self.whitelist_suffix
-    }
-}
-
 pub struct DomainFilter {
     blacklist: Arc<RwLock<DomainSet>>,
     whitelist: Arc<RwLock<DomainSet>>,
@@ -66,18 +51,6 @@ impl DomainFilter {
             std::mem::replace(&mut *write_guard, new_list)
         };
         Ok(())
-    }
-
-    #[must_use]
-    pub fn stats(&self) -> FilterStats {
-        let bl = self.blacklist.read();
-        let wl = self.whitelist.read();
-        FilterStats {
-            blacklist_exact: bl.exact.len(),
-            blacklist_suffix: bl.suffix_trie.len(),
-            whitelist_exact: wl.exact.len(),
-            whitelist_suffix: wl.suffix_trie.len(),
-        }
     }
 
     #[must_use]
@@ -118,7 +91,7 @@ impl DomainFilter {
 
     fn load(path: &Path, name: &str) -> Result<DomainSet> {
         let metadata = std::fs::metadata(path)
-            .with_context(|| format!("Failed to read metadata for {} file: {:?}", name, path))?;
+            .with_context(|| format!("Failed to read metadata for {name} file: {path:?}"))?;
 
         if metadata.len() > MAX_FILE_SIZE {
             anyhow::bail!(
@@ -130,7 +103,7 @@ impl DomainFilter {
         }
 
         let file = File::open(path)
-            .with_context(|| format!("Failed to open {} file: {:?}", name, path))?;
+            .with_context(|| format!("Failed to open {name} file: {path:?}"))?;
         let reader = BufReader::with_capacity(BUFFER_SIZE, file);
 
         let mut exact = HashSet::new();
@@ -140,7 +113,7 @@ impl DomainFilter {
         let mut invalid_count = 0;
 
         for line in reader.lines() {
-            let line = line.with_context(|| format!("Failed to read line from {}", name))?;
+            let line = line.with_context(|| format!("Failed to read line from {name}"))?;
             raw_count += 1;
 
             if let Some(parsed) = Self::parse_domain_line(&line) {
@@ -169,10 +142,7 @@ impl DomainFilter {
 
             if valid_count > MAX_DOMAINS {
                 anyhow::bail!(
-                    "Too many domains in {}: {} (max: {})",
-                    name,
-                    valid_count,
-                    MAX_DOMAINS
+                    "Too many domains in {name}: {valid_count} (max: {MAX_DOMAINS})"
                 );
             }
         }
@@ -285,7 +255,7 @@ impl DomainSet {
                     let mut matched_suffix = key.as_bytes().to_vec();
                     matched_suffix.reverse();
                     let suffix_str = unsafe { String::from_utf8_unchecked(matched_suffix) };
-                    return (true, Some(format!("Suffix Match: *.{}", suffix_str)));
+                    return (true, Some(format!("Suffix Match: *.{suffix_str}")));
                 }
             }
         }

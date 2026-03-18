@@ -1,0 +1,2 @@
+    Checking tls-proxy v0.1.5 (/home/ubuntu/rust/tls-ubuntu)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.19s
