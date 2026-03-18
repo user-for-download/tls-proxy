@@ -102,8 +102,8 @@ impl DomainFilter {
             );
         }
 
-        let file = File::open(path)
-            .with_context(|| format!("Failed to open {name} file: {path:?}"))?;
+        let file =
+            File::open(path).with_context(|| format!("Failed to open {name} file: {path:?}"))?;
         let reader = BufReader::with_capacity(BUFFER_SIZE, file);
 
         let mut exact = HashSet::new();
@@ -141,9 +141,7 @@ impl DomainFilter {
             }
 
             if valid_count > MAX_DOMAINS {
-                anyhow::bail!(
-                    "Too many domains in {name}: {valid_count} (max: {MAX_DOMAINS})"
-                );
+                anyhow::bail!("Too many domains in {name}: {valid_count} (max: {MAX_DOMAINS})");
             }
         }
 

@@ -910,7 +910,9 @@ async fn handle_http(
         None => TcpStream::connect((host, port)).await,
     };
 
-    let mut server = if let Ok(s) = server_res { s } else {
+    let mut server = if let Ok(s) = server_res {
+        s
+    } else {
         let _ = client.write_all(RESPONSE_502).await;
         return Ok(());
     };
